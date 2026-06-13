@@ -15,6 +15,11 @@ function collectMedia() {
   const EXCLUSION_SEL = 'nav, footer, [role="navigation"], [role="contentinfo"], .nav, .footer, .sidebar, .widget, .ad, .advertisement';
   const UI_CLASS_PAT  = /\b(logo|icon|avatar|sprite|btn|button|thumb|emoji|badge|star|rating|flag|arrow|bullet|dot|menu|burger|close|search|social)\b/i;
 
+  // Common lazy-loading data attributes (lazyload.js, lozad, vanilla-lazyload, etc.)
+  const LAZY_ATTRS        = ["data-src", "data-original", "data-lazy", "data-lazy-src",
+                             "data-full-url", "data-large", "data-hi-res-src", "data-url"];
+  const LAZY_SRCSET_ATTRS = ["data-srcset", "data-original-set", "data-lazy-srcset"];
+
   // Resolve any URL (relative or absolute) to an absolute http/https URL
   function abs(url) {
     if (!url || typeof url !== "string") return null;
@@ -22,11 +27,23 @@ function collectMedia() {
     if (!url) return null;
     try {
       const resolved = new URL(url, window.location.href).href;
-      // Only return http/https — reject blob, data, javascript, etc.
       return resolved.startsWith("http") ? resolved : null;
     } catch {
       return null;
     }
+  }
+
+  // Pick the widest / highest-density source from an HTML srcset string
+  function bestSrcset(srcset) {
+    if (!srcset) return null;
+    let best = null, bestW = 0;
+    for (const part of srcset.split(",")) {
+      const [u, d = ""] = part.trim().split(/\s+/);
+      if (!u) continue;
+      const w = d.endsWith("w") ? (parseInt(d) || 0) : (parseFloat(d) || 1) * 1000;
+      if (w > bestW) { best = u; bestW = w; }
+    }
+    return best ? abs(best) : null;
   }
 
   // ── Image scoring ─────────────────────────────────────────────────────────
@@ -73,19 +90,39 @@ function collectMedia() {
     }
   }
 
-  document.querySelectorAll("img").forEach((el) => {
-    const src = abs(el.currentSrc || el.src);
-    if (!src) return;
+  function processImgEl(el) {
+    const src   = abs(el.currentSrc || el.src);
     const score = scoreImgEl(el);
-    const rect = el.getBoundingClientRect();
-    addImg(src, {
-      alt: el.alt || "",
+    const rect  = el.getBoundingClientRect();
+    const extra = {
+      alt:      el.alt || "",
       renderedW: Math.round(rect.width),
       renderedH: Math.round(rect.height),
-      naturalW: el.naturalWidth || 0,
-      naturalH: el.naturalHeight || 0,
-    }, score);
-  });
+      naturalW:  el.naturalWidth  || 0,
+      naturalH:  el.naturalHeight || 0,
+    };
+
+    if (src) addImg(src, extra, score);
+
+    // Best candidate from srcset (picks widest descriptor for higher resolution)
+    const hires = bestSrcset(el.getAttribute("srcset") || "")
+               || bestSrcset(el.getAttribute("data-srcset") || "");
+    if (hires && hires !== src) addImg(hires, extra, score);
+
+    // Lazy-load plain URL attrs
+    for (const attr of LAZY_ATTRS) {
+      const u = abs(el.getAttribute(attr));
+      if (u && u !== src && u !== hires) addImg(u, extra, score);
+    }
+
+    // Lazy-load srcset attrs
+    for (const attr of LAZY_SRCSET_ATTRS) {
+      const h = bestSrcset(el.getAttribute(attr) || "");
+      if (h && h !== src && h !== hires) addImg(h, extra, score);
+    }
+  }
+
+  document.querySelectorAll("img").forEach(processImgEl);
 
   document.querySelectorAll("*").forEach((el) => {
     const bg = window.getComputedStyle(el).backgroundImage;
@@ -94,7 +131,7 @@ function collectMedia() {
       const url = m[1];
       if (!url) continue;
       const score = scoreBgEl(el);
-      const rect = el.getBoundingClientRect();
+      const rect  = el.getBoundingClientRect();
       addImg(url, { alt: "", renderedW: Math.round(rect.width), renderedH: Math.round(rect.height), naturalW: 0, naturalH: 0 }, score);
     }
   });
@@ -113,13 +150,11 @@ function collectMedia() {
 
   const IMAGE_EXTS = /\.(jpe?g|png|gif|webp|avif|bmp|tiff?|svg)(\?.*)?$/i;
   const VIDEO_EXTS = /\.(mp4|webm|ogg|ogv|mov|avi|mkv|flv|wmv|m4v|ts|m3u8|mpd)(\?.*)?$/i;
+  const HLS_PAT    = /\.(m3u8|mpd)(\?.*)?$/i;
 
-  // URLs that look like streaming platform pages — not directly downloadable files.
-  // Matches YouTube watch/embed/shorts, Vimeo pages, Dailymotion, Twitch clips, etc.
   const STREAMING_PAGE_PAT = /\b(youtube\.com\/(watch|embed|shorts|live)|youtu\.be\/|player\.vimeo\.com\/|vimeo\.com\/(video\/\d+|channels|groups|album)|dailymotion\.com\/(video|embed\/video)|twitch\.tv\/|facebook\.com\/watch|instagram\.com\/reel)\b/i;
 
   function isStreamingPage(url) {
-    // Only exclude if the URL has no direct video file extension AND matches a streaming platform
     return !VIDEO_EXTS.test(url) && STREAMING_PAGE_PAT.test(url);
   }
 
@@ -134,49 +169,36 @@ function collectMedia() {
   // ── Videos ────────────────────────────────────────────────────────────────
 
   const vidMap = new Map();
-
-  // Tracks which URLs came from a real <video> element (for isMain override)
   const fromVideoElement = new Set();
 
   function addVid(url, entry) {
     if (!url || isStreamingPage(url)) return;
     if (vidMap.has(url)) return;
-    vidMap.set(url, { ...entry, url });
+    // HLS/DASH manifests (.m3u8, .mpd) are not standalone video files —
+    // they're playlists. Detect but exclude from "Principaux" to avoid
+    // misleading the user into downloading a text manifest.
+    const isHLS = HLS_PAT.test(url);
+    vidMap.set(url, { ...entry, url, ...(isHLS && { isHLS: true, isMain: false }) });
   }
 
   // --- <video> elements ---
-  // Any URL found in a <video> element is treated as "main" regardless of
-  // rendered dimensions — the player may be off-screen or not yet laid out
-  // (common with lazy-loading and single-page apps like Erome).
   document.querySelectorAll("video").forEach((el) => {
-    const rect = el.getBoundingClientRect();
+    const rect     = el.getBoundingClientRect();
     const rw = rect.width, rh = rect.height;
-    // Score still reflects visible size for sorting, but isMain is always true
-    // for <video>-sourced URLs so they're never hidden in the default view.
-    const score = Math.max((rw * rh / vpArea) * 100, 10); // floor at 10 so they sort above script-found
+    const score    = Math.max((rw * rh / vpArea) * 100, 10);
     const poster   = abs(el.poster) || abs(el.getAttribute("poster")) || "";
     const duration = isFinite(el.duration) ? el.duration : 0;
     const base     = { poster, duration, renderedW: Math.round(rw), renderedH: Math.round(rh), score, isMain: true };
 
-    // Every possible place a video source URL can live
     const raw = [
-      el.getAttribute("src"),
-      el.src,
-      el.currentSrc,
-      el.dataset.src,
-      el.dataset.videoSrc,
-      el.dataset.videoUrl,
-      el.dataset.mp4,
-      el.dataset.webm,
-      el.dataset.hlsSrc,
-      el.dataset.manifest,
-      el.dataset.file,       // JW Player
-      el.dataset.source,
+      el.getAttribute("src"), el.src, el.currentSrc,
+      el.dataset.src, el.dataset.videoSrc, el.dataset.videoUrl,
+      el.dataset.mp4, el.dataset.webm, el.dataset.hlsSrc,
+      el.dataset.manifest, el.dataset.file, el.dataset.source,
       (() => {
         try { return JSON.parse(el.getAttribute("data-setup") || "{}").sources?.[0]?.src; } catch { return null; }
       })(),
     ];
-
     el.querySelectorAll("source").forEach((s) => {
       raw.push(s.getAttribute("src"), s.src, s.dataset.src, s.dataset.srcMp4, s.dataset.srcWebm);
     });
@@ -184,18 +206,13 @@ function collectMedia() {
     const seen = new Set();
     raw.forEach((v) => {
       const u = abs(v);
-      if (u && !seen.has(u)) {
-        seen.add(u);
-        fromVideoElement.add(u);
-        addVid(u, base);
-      }
+      if (u && !seen.has(u)) { seen.add(u); fromVideoElement.add(u); addVid(u, base); }
     });
   });
 
-  // --- og:video (only if not a streaming platform page URL) ---
+  // --- og:video ---
   document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"]').forEach((meta) => {
     const url = abs(meta.getAttribute("content"));
-    // og:video often points to embed pages on YouTube/Vimeo — skip those
     if (url && !isStreamingPage(url)) {
       addVid(url, { poster: "", duration: 0, renderedW: 0, renderedH: 0, score: 50, isMain: true });
     }
@@ -205,17 +222,16 @@ function collectMedia() {
   document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
     try {
       const parsed = JSON.parse(script.textContent);
-      const items = Array.isArray(parsed) ? parsed : [parsed];
-      const check = (item) => {
+      const items  = Array.isArray(parsed) ? parsed : [parsed];
+      const check  = (item) => {
         if (!item || typeof item !== "object") return;
         const t = item["@type"];
         if (t === "VideoObject" || t === "Video") {
           [item.contentUrl, item.embedUrl].forEach((u) => {
-            const resolved = abs(u);
-            if (resolved) addVid(resolved, { poster: abs(item.thumbnailUrl) || "", duration: 0, renderedW: 0, renderedH: 0, score: 50, isMain: true });
+            const r = abs(u);
+            if (r) addVid(r, { poster: abs(item.thumbnailUrl) || "", duration: 0, renderedW: 0, renderedH: 0, score: 50, isMain: true });
           });
         }
-        // Recurse into nested objects / arrays
         Object.values(item).forEach((v) => {
           if (Array.isArray(v)) v.forEach(check);
           else if (v && typeof v === "object") check(v);
@@ -225,16 +241,12 @@ function collectMedia() {
     } catch {}
   });
 
-  // --- Inline <script> tags: extract video URL literals ---
-  // Only matches URLs with explicit video extensions to avoid false positives.
-  // URLs already found in a <video> element are skipped (deduplicated by addVid).
+  // --- Inline <script> tags: video URL literals ---
   const INLINE_VID_PAT = /["'`](https?:\/\/[^"'`\s]{4,}\.(mp4|webm|m3u8|mpd|ogg|ogv|mov|m4v|ts)(?:\?[^"'`\s]*)?)[`'"]/g;
   document.querySelectorAll("script:not([src])").forEach((script) => {
     for (const m of script.textContent.matchAll(INLINE_VID_PAT)) {
       const url = abs(m[1]);
       if (!url || vidMap.has(url)) continue;
-      // If this URL was already seen via a <video> element, skip (addVid deduplicates)
-      // Mark as main only if it came from a <video> element
       const isMain = fromVideoElement.has(url);
       addVid(url, { poster: "", duration: 0, renderedW: 0, renderedH: 0, score: isMain ? 10 : 5, isMain });
     }
@@ -247,6 +259,38 @@ function collectMedia() {
       addVid(href, { poster: "", duration: 0, renderedW: 0, renderedH: 0, score: 0, isMain: false });
     }
   });
+
+  // ── Shadow DOM scan ───────────────────────────────────────────────────────
+  // querySelectorAll does not cross shadow boundaries, so we walk each element
+  // that exposes a shadowRoot and repeat the img/video scan inside it.
+
+  document.querySelectorAll("*").forEach((host) => {
+    const root = host.shadowRoot;
+    if (!root) return;
+
+    root.querySelectorAll("img").forEach(processImgEl);
+
+    root.querySelectorAll("video").forEach((el) => {
+      const rect     = el.getBoundingClientRect();
+      const rw = rect.width, rh = rect.height;
+      const score    = Math.max((rw * rh / vpArea) * 100, 10);
+      const base     = {
+        poster:    abs(el.poster) || "",
+        duration:  isFinite(el.duration) ? el.duration : 0,
+        renderedW: Math.round(rw), renderedH: Math.round(rh), score, isMain: true,
+      };
+      [el.getAttribute("src"), el.src, el.currentSrc].forEach((v) => {
+        const u = abs(v);
+        if (u) { fromVideoElement.add(u); addVid(u, base); }
+      });
+      el.querySelectorAll("source").forEach((s) => {
+        const u = abs(s.src || s.getAttribute("src"));
+        if (u) { fromVideoElement.add(u); addVid(u, base); }
+      });
+    });
+  });
+
+  // ── Results ───────────────────────────────────────────────────────────────
 
   const allImages = Array.from(imgMap.values()).sort((a, b) => b.score - a.score);
   const allVideos = Array.from(vidMap.values()).sort((a, b) => b.score - a.score);
@@ -263,86 +307,9 @@ function collectMedia() {
 
 // ── Message handler ───────────────────────────────────────────────────────────
 
-// Guard against duplicate downloads: content.js can be injected multiple times
-// (manifest + executeScript in loadMedia), which creates multiple listeners.
-// Without this set, every listener instance would start its own fetch for the
-// same URL, resulting in multiple copies of the file being saved.
-const _activeDownloads = new Set();
-
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "getMedia") {
     sendResponse(collectMedia());
     return true;
-  }
-
-  // Download via fetch+blob in the page context, reporting live progress to
-  // chrome.storage.local under key "dl_<id>" so the popup can show status even
-  // after it is closed. The popup sets a declarativeNetRequest Referer+CORS rule
-  // before sending this message. sendResponse is synchronous (ok:true =
-  // "started") so the popup can close immediately.
-  if (msg.action === "downloadBlob") {
-    if (_activeDownloads.has(msg.url)) { sendResponse({ ok: true }); return false; }
-    _activeDownloads.add(msg.url);
-    sendResponse({ ok: true });
-
-    const id   = msg.id;
-    const name = (msg.filename || "").split("/").pop() || "media";
-    const key  = "dl_" + id;
-    const setStatus = (patch) =>
-      chrome.storage.local.set({ [key]: { id, name, url: msg.url, ts: Date.now(), ...patch } });
-
-    (async () => {
-      try {
-        setStatus({ state: "fetching", received: 0, total: 0 });
-
-        const resp = await fetch(msg.url, { credentials: "include" });
-        if (!resp.ok) { setStatus({ state: "error", error: "HTTP " + resp.status, received: 0, total: 0 }); return; }
-
-        const ct = resp.headers.get("content-type") || "";
-        if (/text\/html/i.test(ct)) { setStatus({ state: "error", error: "Page HTML (protégé)", received: 0, total: 0 }); return; }
-
-        const total = +(resp.headers.get("content-length") || 0);
-
-        // Stream the body so we can report progress during the (often long) fetch.
-        let blob;
-        if (resp.body && resp.body.getReader) {
-          const reader = resp.body.getReader();
-          const chunks = [];
-          let received = 0, lastWrite = 0;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            received += value.length;
-            const now = Date.now();
-            if (now - lastWrite > 250) { lastWrite = now; setStatus({ state: "fetching", received, total }); }
-          }
-          blob = new Blob(chunks, { type: ct });
-        } else {
-          blob = await resp.blob();
-        }
-
-        if (!blob.size) { setStatus({ state: "error", error: "Fichier vide", received: 0, total: 0 }); return; }
-
-        setStatus({ state: "saving", received: blob.size, total: blob.size });
-
-        const blobUrl = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href     = blobUrl;
-        a.download = msg.filename || "";
-        a.style.display = "none";
-        (document.body || document.documentElement).appendChild(a);
-        a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-        setTimeout(() => { try { a.remove(); URL.revokeObjectURL(blobUrl); } catch {} }, 120_000);
-
-        setStatus({ state: "done", received: blob.size, total: blob.size });
-      } catch (e) {
-        setStatus({ state: "error", error: String((e && e.message) || e), received: 0, total: 0 });
-      } finally {
-        _activeDownloads.delete(msg.url);
-      }
-    })();
-
-    return false;
   }
 });

@@ -911,3 +911,33 @@ body {
 .dl-item.state-error .dl-pct { color: var(--error); }
 .dl-item.state-error .dl-bar-fill { background: var(--error); width: 100% !important; }
 .dl-item.state-error .dl-sub { color: #fda4af; }
+
+/* cancel button inside dl-item */
+.dl-cancel {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+.dl-cancel:hover { color: var(--error); background: rgba(244,63,94,.12); }
+.dl-cancel.hidden { display: none; }
+
+/* HLS/DASH badge on video cards */
+.hls-badge {
+  font-size: 8.5px;
+  font-weight: 700;
+  color: var(--warning);
+  background: var(--warning-dim);
+  border: 1px solid rgba(245,158,11,.25);
+  border-radius: 4px;
+  padding: 1px 5px;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
+  flex-shrink: 0;
+}

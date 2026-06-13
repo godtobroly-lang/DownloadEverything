@@ -89,33 +89,30 @@ async function getPageUrl() {
   try { return (await chrome.tabs.get(tabId)).url || null; } catch { return null; }
 }
 
-// declarativeNetRequest is the only API that can set the Referer header at the
-// network layer. The popup adds a temporary rule before the content script
-// fetches, so its request carries the correct Referer for CDN hotlink checks.
-//
-// MV3 content-script fetches are subject to CORS (unlike extension pages, they
-// are NOT exempted by host_permissions), so the same rule also injects CORS
-// response headers — otherwise the cross-origin fetch is blocked and nothing
-// downloads. The rule is removed on the next popup open (see init).
-const REFERER_RULE_ID = 1037;
+// declarativeNetRequest injects the Referer at network layer so CDN hotlink
+// checks pass for chrome.downloads requests.  We use per-host rule IDs
+// (derived from a stable hash of the hostname) so up to RULE_ID_RANGE distinct
+// CDN hosts can have live rules simultaneously during a batch download.
+const RULE_ID_BASE  = 1037;
+const RULE_ID_RANGE = 50; // rule IDs 1037 … 1086
+
+function hostToRuleId(host) {
+  let h = 0;
+  for (let i = 0; i < host.length; i++) h = (h * 31 + host.charCodeAt(i)) & 0xffff;
+  return RULE_ID_BASE + (h % RULE_ID_RANGE);
+}
 
 async function addRefererRule(host, referer) {
-  let origin = "*";
-  try { origin = new URL(referer).origin; } catch {}
-
+  const ruleId = hostToRuleId(host);
   await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [REFERER_RULE_ID],
+    removeRuleIds: [ruleId],
     addRules: [{
-      id: REFERER_RULE_ID,
+      id: ruleId,
       priority: 1,
       action: {
         type: "modifyHeaders",
         requestHeaders: [
           { header: "referer", operation: "set", value: referer },
-        ],
-        responseHeaders: [
-          { header: "access-control-allow-origin",      operation: "set", value: origin },
-          { header: "access-control-allow-credentials", operation: "set", value: "true" },
         ],
       },
       condition: {
@@ -126,9 +123,13 @@ async function addRefererRule(host, referer) {
   });
 }
 
-async function removeRefererRule() {
+async function removeAllRefererRules() {
   try {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [REFERER_RULE_ID] });
+    const existing = await chrome.declarativeNetRequest.getDynamicRules();
+    const toRemove = existing
+      .filter((r) => r.id >= RULE_ID_BASE && r.id < RULE_ID_BASE + RULE_ID_RANGE)
+      .map((r) => r.id);
+    if (toRemove.length) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: toRemove });
   } catch {}
 }
 
@@ -137,47 +138,26 @@ function newDownloadId() {
 }
 
 async function downloadOne(url, folder) {
-  const tabId  = await getActiveTabId();
-  if (!tabId) return false;
-
   const pageUrl = await getPageUrl();
   let host = null;
   try { host = new URL(url).hostname; } catch {}
 
-  // Set the DNR Referer rule BEFORE the content script starts its fetch so the
-  // request to the CDN carries the correct Referer header.
-  if (host && pageUrl) {
-    await addRefererRule(host, pageUrl);
-  }
+  // Inject Referer before the download request so CDN hotlink checks pass.
+  if (host && pageUrl) await addRefererRule(host, pageUrl);
 
   const id   = newDownloadId();
-  const base = filename(url);
   const full = buildFilename(url, folder);
 
-  // Optimistic status entry so the download shows in the panel immediately.
-  chrome.storage.local.set({ ["dl_" + id]: { id, name: base, url, state: "queued", received: 0, total: 0, ts: Date.now() } });
-
-  // The content script responds immediately (ok:true = "started"), then
-  // continues the fetch+blob+<a download> in the background — so this popup
-  // can be closed at any time without cancelling the download.
+  // Delegate the actual download to the background service worker which uses
+  // chrome.downloads — no RAM accumulation, no popup-must-stay-open constraint,
+  // and chrome.downloads handles filename deduplication automatically.
   const started = await new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, {
-      action: "downloadBlob",
-      id,
-      url,
-      filename: full,
-    }, (resp) => {
+    chrome.runtime.sendMessage({ action: "bgDownload", id, url, filename: full }, (resp) => {
       if (chrome.runtime.lastError || !resp?.ok) { resolve(false); return; }
       resolve(true);
     });
   });
 
-  if (!started) {
-    chrome.storage.local.set({ ["dl_" + id]: { id, name: base, url, state: "error", error: "Onglet inaccessible", received: 0, total: 0, ts: Date.now() } });
-    await removeRefererRule();
-  }
-  // On success the rule stays until next popup open (fetch may still be in
-  // flight); removeRefererRule() in init handles cleanup.
   return started;
 }
 
@@ -246,7 +226,7 @@ const DL_STATE_LABEL = {
   error:    "Échec",
 };
 
-function makeDlNode(e) {
+function dlItemParts(e) {
   const pct   = e.total ? Math.min(100, Math.round((e.received / e.total) * 100)) : 0;
   const indet = (e.state === "fetching" || e.state === "queued") && !e.total;
   const badge = e.state === "done" ? "✓" : e.state === "error" ? "✕" : (e.total ? pct + "%" : "");
@@ -256,6 +236,12 @@ function makeDlNode(e) {
       ? `${formatBytes(e.received)} / ${formatBytes(e.total)}`
       : (e.received ? formatBytes(e.received) : DL_STATE_LABEL[e.state] || "");
   const fillW = e.state === "done" ? 100 : pct;
+  const active = e.state === "queued" || e.state === "fetching" || e.state === "saving";
+  return { pct, indet, badge, sub, fillW, active };
+}
+
+function makeDlNode(e) {
+  const { indet, badge, sub, fillW, active } = dlItemParts(e);
 
   const div = document.createElement("div");
   div.className = `dl-item state-${e.state}`;
@@ -264,6 +250,7 @@ function makeDlNode(e) {
     <div class="dl-item-top">
       <span class="dl-name" title="${e.name}">${e.name}</span>
       <span class="dl-pct">${badge}</span>
+      <button class="dl-cancel${active ? "" : " hidden"}" data-id="${e.id}" title="Annuler">✕</button>
     </div>
     <div class="dl-bar${indet ? " indeterminate" : ""}"><div class="dl-bar-fill" style="width:${fillW}%"></div></div>
     <div class="dl-sub">${sub}</div>`;
@@ -271,25 +258,19 @@ function makeDlNode(e) {
 }
 
 function patchDlNode(node, e) {
-  const pct   = e.total ? Math.min(100, Math.round((e.received / e.total) * 100)) : 0;
-  const indet = (e.state === "fetching" || e.state === "queued") && !e.total;
-  const badge = e.state === "done" ? "✓" : e.state === "error" ? "✕" : (e.total ? pct + "%" : "");
-  const sub   = e.state === "error"
-    ? (e.error || "Erreur")
-    : e.total
-      ? `${formatBytes(e.received)} / ${formatBytes(e.total)}`
-      : (e.received ? formatBytes(e.received) : DL_STATE_LABEL[e.state] || "");
-  const fillW = e.state === "done" ? 100 : pct;
+  const { indet, badge, sub, fillW, active } = dlItemParts(e);
 
   node.className = `dl-item state-${e.state}`;
-  const pctEl  = node.querySelector(".dl-pct");
-  const barEl  = node.querySelector(".dl-bar");
-  const fillEl = node.querySelector(".dl-bar-fill");
-  const subEl  = node.querySelector(".dl-sub");
-  if (pctEl)  pctEl.textContent = badge;
-  if (barEl)  barEl.classList.toggle("indeterminate", indet);
-  if (fillEl) fillEl.style.width = fillW + "%";
-  if (subEl)  subEl.textContent = sub;
+  const pctEl    = node.querySelector(".dl-pct");
+  const barEl    = node.querySelector(".dl-bar");
+  const fillEl   = node.querySelector(".dl-bar-fill");
+  const subEl    = node.querySelector(".dl-sub");
+  const cancelEl = node.querySelector(".dl-cancel");
+  if (pctEl)    pctEl.textContent = badge;
+  if (barEl)    barEl.classList.toggle("indeterminate", indet);
+  if (fillEl)   fillEl.style.width = fillW + "%";
+  if (subEl)    subEl.textContent = sub;
+  if (cancelEl) cancelEl.classList.toggle("hidden", !active);
 }
 
 const EMPTY_DL_HTML = `<div class="empty">
@@ -418,6 +399,7 @@ function makeCard(item, isSecondary) {
     const dur = formatDuration(item.duration);
     if (dur) metaParts.push(dur);
     if (item.renderedW && item.renderedH) metaParts.push(`${item.renderedW}×${item.renderedH}`);
+    if (item.isHLS) metaParts.push("HLS/DASH");
   }
 
   const card = document.createElement("div");
@@ -622,6 +604,32 @@ $("btn-dl-clear").addEventListener("click", async () => {
   refreshDownloads();
 });
 
+// Cancel button — event delegation on the list so dynamic nodes work
+$("dl-list").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".dl-cancel");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  // Optimistic UI update
+  const r = await chrome.storage.local.get("dl_" + id);
+  const entry = r["dl_" + id];
+  if (entry && entry.state !== "done") {
+    chrome.storage.local.set({ ["dl_" + id]: { ...entry, state: "error", error: "Annulé", ts: Date.now() } });
+  }
+  chrome.runtime.sendMessage({ action: "bgCancel", id });
+});
+
+// Auto-purge completed/failed entries older than 5 minutes
+async function autopurge() {
+  const all = await chrome.storage.local.get(null);
+  const cutoff = Date.now() - 5 * 60 * 1000;
+  const stale = Object.keys(all).filter((k) => {
+    if (!k.startsWith("dl_")) return false;
+    const e = all[k];
+    return (e.state === "done" || e.state === "error") && (e.ts || 0) < cutoff;
+  });
+  if (stale.length) await chrome.storage.local.remove(stale);
+}
+
 // Live status updates — debounced so rapid storage writes (every 250ms from the
 // content script) don't cause a full DOM rebuild on every tick.
 let _dlRefreshTimer = null;
@@ -634,10 +642,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
-// Remove any Referer rule left behind if a previous popup closed mid-download
-// (dynamic rules persist in declarativeNetRequest storage).
-removeRefererRule();
+// Clean up any Referer rules left over from a previous session
+removeAllRefererRules();
 
+autopurge();
 updateToggleBtn();
 loadSavedFolder();
 loadMedia();
