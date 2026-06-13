@@ -92,12 +92,10 @@ async function getPageUrl() {
   try { return (await chrome.tabs.get(tabId)).url || null; } catch { return null; }
 }
 
-// Many CDNs (Erome, etc.) only serve media when the request carries the right
-// Referer.  Neither fetch() nor chrome.downloads can set Referer — it's a
-// forbidden header in both APIs.  declarativeNetRequest CAN, because it rewrites
-// headers at the network layer.  We add a temporary rule that forces the Referer
-// for requests to the media host, then fetch the file from the popup (extension
-// pages bypass CORS for hosts in host_permissions) and download the blob.
+// declarativeNetRequest is the only API that can set the Referer header at the
+// network layer. We add a temporary rule before asking the content script to
+// fetch, so its request carries the correct Referer for CDN hotlink checks.
+// The rule is removed on the next popup open (see init).
 const REFERER_RULE_ID = 1037;
 
 async function addRefererRule(host, referer) {
@@ -124,61 +122,42 @@ async function removeRefererRule() {
   } catch {}
 }
 
-// Content-script fallback: fetch+blob+<a download> inside the page context, which
-// carries the page's Referer and cookies automatically.  Cannot target a chosen
-// sub-folder, but guarantees the file is saved when the primary path is blocked.
-async function downloadViaContentScript(url, folder) {
-  try {
-    const tabId = await getActiveTabId();
-    if (tabId == null) return false;
-    const resp = await chrome.tabs.sendMessage(tabId, {
-      action: "downloadViaLink",
-      url,
-      filename: buildFilename(url, folder),
-    });
-    return resp?.ok === true;
-  } catch {
-    return false;
-  }
-}
-
 async function downloadOne(url, folder) {
+  const tabId  = await getActiveTabId();
+  if (!tabId) return false;
+
+  const pageUrl = await getPageUrl();
   let host = null;
   try { host = new URL(url).hostname; } catch {}
 
-  // Primary path: DNR injects Referer → fetch from popup (CORS-exempt, sends
-  // cookies) → blob → chrome.downloads (so the chosen folder is respected).
-  if (host) {
-    const pageUrl = await getPageUrl();
-    let blob = null;
-    try {
-      if (pageUrl) await addRefererRule(host, pageUrl);
-      const resp = await fetch(url, { credentials: "include" });
-      if (resp.ok) blob = await resp.blob();
-    } catch (e) {
-      console.warn("Popup fetch failed:", e?.message, url);
-    } finally {
-      await removeRefererRule();
-    }
-
-    // Reject empty bodies and HTML error pages masquerading as the file.
-    if (blob && blob.size > 0 && !/text\/html/i.test(blob.type)) {
-      const blobUrl = URL.createObjectURL(blob);
-      const { id, err } = await new Promise((resolve) => {
-        chrome.downloads.download({
-          url: blobUrl,
-          filename: buildFilename(url, folder),
-          saveAs: false,
-          conflictAction: "uniquify",
-        }, (id) => resolve({ id, err: chrome.runtime.lastError?.message || null }));
-      });
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 120_000);
-      if (id != null && !err) return true;
-    }
+  // Set the DNR Referer rule BEFORE the content script starts its fetch so the
+  // request to the CDN carries the correct Referer header.
+  if (host && pageUrl) {
+    await addRefererRule(host, pageUrl);
   }
 
-  // Fallback: let the page download it (correct Referer + cookies, no folder).
-  return downloadViaContentScript(url, folder);
+  // Inject latest content.js in case the tab was open before extension reload.
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] }).catch(() => {});
+
+  // The content script responds immediately (ok:true = "started"), then
+  // continues the fetch+blob+<a download> in the background — so this popup
+  // can be closed at any time without cancelling the download.
+  const started = await new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, {
+      action: "downloadBlob",
+      url,
+      filename: buildFilename(url, folder),
+    }, (resp) => {
+      if (chrome.runtime.lastError || !resp?.ok) { resolve(false); return; }
+      resolve(true);
+    });
+  });
+
+  // If content script couldn't be reached, clean up rule immediately.
+  if (!started) { await removeRefererRule(); }
+  // Otherwise, the rule stays until next popup open (content script fetch may
+  // still be in flight); removeRefererRule() in init handles cleanup.
+  return started;
 }
 
 async function downloadBatch(items, folder) {

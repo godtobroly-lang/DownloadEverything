@@ -269,20 +269,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
-  // Fallback download: fetch in page context (carries page Referer + cookies),
-  // create a same-origin blob URL, then click <a download>.
-  // Responds immediately so the message channel doesn't time out on large files;
-  // the actual fetch+save continues in the background after the popup closes.
-  if (msg.action === "downloadViaLink") {
-    sendResponse({ ok: true }); // immediate ack — popup can update its UI now
+  // Download via fetch+blob in the page context.
+  // The popup sets a declarativeNetRequest Referer rule before sending this
+  // message, so the fetch carries the correct Referer for CDN hotlink checks.
+  // sendResponse is called synchronously (ok:true = "started") so the popup
+  // can close immediately; the fetch continues in the background.
+  if (msg.action === "downloadBlob") {
+    sendResponse({ ok: true });   // immediate — popup can close
 
     (async () => {
       try {
         const resp = await fetch(msg.url, { credentials: "include" });
         if (!resp.ok) return;
-        const blob    = await resp.blob();
-        const blobUrl = URL.createObjectURL(blob);
+        const ct = resp.headers.get("content-type") || "";
+        if (/text\/html/i.test(ct)) return;      // reject CDN error pages
+        const blob = await resp.blob();
+        if (!blob.size) return;
 
+        const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href     = blobUrl;
         a.download = msg.filename || "";
@@ -290,10 +294,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         (document.body || document.documentElement).appendChild(a);
         a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
 
-        setTimeout(() => { try { a.remove(); URL.revokeObjectURL(blobUrl); } catch {} }, 60_000);
+        setTimeout(() => { try { a.remove(); URL.revokeObjectURL(blobUrl); } catch {} }, 120_000);
       } catch {}
     })();
 
-    return false; // already called sendResponse synchronously
+    return false;  // sendResponse already called synchronously
   }
 });
