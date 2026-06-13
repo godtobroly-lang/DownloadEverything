@@ -246,7 +246,7 @@ const DL_STATE_LABEL = {
   error:    "Échec",
 };
 
-function renderDlItem(e) {
+function makeDlNode(e) {
   const pct   = e.total ? Math.min(100, Math.round((e.received / e.total) * 100)) : 0;
   const indet = (e.state === "fetching" || e.state === "queued") && !e.total;
   const badge = e.state === "done" ? "✓" : e.state === "error" ? "✕" : (e.total ? pct + "%" : "");
@@ -257,15 +257,50 @@ function renderDlItem(e) {
       : (e.received ? formatBytes(e.received) : DL_STATE_LABEL[e.state] || "");
   const fillW = e.state === "done" ? 100 : pct;
 
-  return `<div class="dl-item state-${e.state}">
+  const div = document.createElement("div");
+  div.className = `dl-item state-${e.state}`;
+  div.dataset.dlId = e.id;
+  div.innerHTML = `
     <div class="dl-item-top">
       <span class="dl-name" title="${e.name}">${e.name}</span>
       <span class="dl-pct">${badge}</span>
     </div>
-    <div class="dl-bar ${indet ? "indeterminate" : ""}"><div class="dl-bar-fill" style="width:${fillW}%"></div></div>
-    <div class="dl-sub">${sub}</div>
-  </div>`;
+    <div class="dl-bar${indet ? " indeterminate" : ""}"><div class="dl-bar-fill" style="width:${fillW}%"></div></div>
+    <div class="dl-sub">${sub}</div>`;
+  return div;
 }
+
+function patchDlNode(node, e) {
+  const pct   = e.total ? Math.min(100, Math.round((e.received / e.total) * 100)) : 0;
+  const indet = (e.state === "fetching" || e.state === "queued") && !e.total;
+  const badge = e.state === "done" ? "✓" : e.state === "error" ? "✕" : (e.total ? pct + "%" : "");
+  const sub   = e.state === "error"
+    ? (e.error || "Erreur")
+    : e.total
+      ? `${formatBytes(e.received)} / ${formatBytes(e.total)}`
+      : (e.received ? formatBytes(e.received) : DL_STATE_LABEL[e.state] || "");
+  const fillW = e.state === "done" ? 100 : pct;
+
+  node.className = `dl-item state-${e.state}`;
+  const pctEl  = node.querySelector(".dl-pct");
+  const barEl  = node.querySelector(".dl-bar");
+  const fillEl = node.querySelector(".dl-bar-fill");
+  const subEl  = node.querySelector(".dl-sub");
+  if (pctEl)  pctEl.textContent = badge;
+  if (barEl)  barEl.classList.toggle("indeterminate", indet);
+  if (fillEl) fillEl.style.width = fillW + "%";
+  if (subEl)  subEl.textContent = sub;
+}
+
+const EMPTY_DL_HTML = `<div class="empty">
+  <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+  </svg>
+  Aucun téléchargement pour l'instant.
+</div>`;
+
+// id → last-rendered entry snapshot (used to skip no-op patches)
+const _dlRendered = new Map();
 
 async function refreshDownloads() {
   const all = await chrome.storage.local.get(null);
@@ -276,18 +311,55 @@ async function refreshDownloads() {
     .sort((a, b) => (b.ts || 0) - (a.ts || 0));
 
   const list = $("dl-list");
-  if (list) {
-    list.innerHTML = entries.length
-      ? entries.map(renderDlItem).join("")
-      : `<div class="empty">
-           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3">
-             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-           </svg>
-           Aucun téléchargement pour l'instant.
-         </div>`;
+  if (!list) return;
+
+  if (entries.length === 0) {
+    if (list.dataset.empty !== "1") {
+      list.innerHTML = EMPTY_DL_HTML;
+      list.dataset.empty = "1";
+      _dlRendered.clear();
+    }
+  } else {
+    list.dataset.empty = "0";
+
+    // Determine whether the ordered id list has changed (add/remove/reorder)
+    const renderedIds = [...list.querySelectorAll(".dl-item[data-dl-id]")].map((n) => n.dataset.dlId);
+    const freshIds    = entries.map((e) => e.id);
+    const sameOrder   = renderedIds.length === freshIds.length && freshIds.every((id, i) => id === renderedIds[i]);
+
+    if (!sameOrder) {
+      // Rebuild structure but reuse existing nodes where possible
+      const nodeMap = new Map();
+      list.querySelectorAll(".dl-item[data-dl-id]").forEach((n) => nodeMap.set(n.dataset.dlId, n));
+      list.innerHTML = "";
+      for (const e of entries) {
+        const existing = nodeMap.get(e.id);
+        if (existing) {
+          patchDlNode(existing, e);
+          list.appendChild(existing);
+        } else {
+          list.appendChild(makeDlNode(e));
+        }
+        _dlRendered.set(e.id, e);
+      }
+      // Remove stale cache entries
+      for (const id of _dlRendered.keys()) {
+        if (!freshIds.includes(id)) _dlRendered.delete(id);
+      }
+    } else {
+      // Same items in same order — patch only what changed
+      const nodes = list.querySelectorAll(".dl-item[data-dl-id]");
+      entries.forEach((e, i) => {
+        const prev = _dlRendered.get(e.id);
+        if (!prev || prev.state !== e.state || prev.received !== e.received || prev.total !== e.total) {
+          patchDlNode(nodes[i], e);
+          _dlRendered.set(e.id, e);
+        }
+      });
+    }
   }
 
-  const active = entries.filter((e) => e.state === "fetching" || e.state === "saving" || e.state === "queued").length;
+  const active = entries.filter((e) => ["fetching", "saving", "queued"].includes(e.state)).length;
   const badge  = $("dl-active-count");
   if (badge) {
     badge.textContent = active;
@@ -550,10 +622,14 @@ $("btn-dl-clear").addEventListener("click", async () => {
   refreshDownloads();
 });
 
-// Live status updates — content script writes dl_<id> entries as downloads progress.
+// Live status updates — debounced so rapid storage writes (every 250ms from the
+// content script) don't cause a full DOM rebuild on every tick.
+let _dlRefreshTimer = null;
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
-  if (Object.keys(changes).some((k) => k.startsWith("dl_"))) refreshDownloads();
+  if (!Object.keys(changes).some((k) => k.startsWith("dl_"))) return;
+  clearTimeout(_dlRefreshTimer);
+  _dlRefreshTimer = setTimeout(refreshDownloads, 200);
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
