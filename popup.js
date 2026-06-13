@@ -3,9 +3,11 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let data = { images: [], mainImages: [], videos: [], mainVideos: [] };
-let currentTab = "images";   // "images" | "videos"
-let showMainOnly = true;     // true = principaux, false = tout
-let pendingDownloadItems = null; // items waiting for folder confirmation
+let currentTab   = "images";
+let showMainOnly = true;
+
+// Single modal callback — avoids mixed onclick/addEventListener conflicts
+let modalCallback = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -14,37 +16,34 @@ const $ = (id) => document.getElementById(id);
 function filename(url) {
   try {
     const p = new URL(url).pathname;
-    const name = p.substring(p.lastIndexOf("/") + 1).split("?")[0];
-    return name || "media";
+    let name = decodeURIComponent(p.substring(p.lastIndexOf("/") + 1).split("?")[0]);
+    // Remove characters forbidden in filenames
+    name = name.replace(/[<>:"|?*\\]/g, "_").trim();
+    if (!name || !name.includes(".")) name = "media_" + Date.now();
+    return name;
   } catch {
-    return "media";
+    return "media_" + Date.now();
   }
 }
 
 function sanitizeFolder(raw) {
-  return raw
+  return (raw || "")
     .trim()
-    .replace(/\\/g, "/")            // normalize backslashes
-    .replace(/\.\.+/g, "")         // no parent traversal
-    .replace(/^\/+/, "")           // no leading slash
-    .replace(/\/+$/, "")           // no trailing slash
-    .replace(/[<>:"|?*]/g, "_")    // invalid chars
-    .replace(/\/+/g, "/");         // collapse slashes
+    .replace(/\\/g, "/")
+    .replace(/\.\.+/g, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "")
+    .replace(/[<>:"|?*]/g, "_")
+    .replace(/\/+/g, "/");
 }
 
 function buildFilename(url, folder) {
   const name = filename(url);
-  if (!folder) return name;
-  return `${folder}/${name}`;
-}
-
-function formatDims(w, h) {
-  if (w && h) return `${w} × ${h} px`;
-  return "";
+  return folder ? `${folder}/${name}` : name;
 }
 
 function formatDuration(sec) {
-  if (!sec || isNaN(sec)) return "";
+  if (!sec || !isFinite(sec)) return "";
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
@@ -55,7 +54,7 @@ function showToast(msg, type = "") {
   t.textContent = msg;
   t.className = `toast ${type}`;
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => (t.className = "toast hidden"), 3000);
+  t._timer = setTimeout(() => { t.className = "toast hidden"; }, 3000);
 }
 
 // ── Folder persistence ────────────────────────────────────────────────────────
@@ -70,19 +69,29 @@ function loadSavedFolder() {
 }
 
 function saveFolder(folder) {
-  chrome.storage.local.set({ folder });
+  chrome.storage.local.set({ folder: folder || "" });
 }
 
 function getCurrentFolder() {
   return sanitizeFolder($("input-folder").value);
 }
 
-// ── Download helpers ──────────────────────────────────────────────────────────
+// ── Download ──────────────────────────────────────────────────────────────────
 
 async function downloadOne(url, folder) {
-  const fname = buildFilename(url, folder);
   return new Promise((resolve) => {
-    chrome.downloads.download({ url, filename: fname, saveAs: false }, (id) => {
+    const opts = {
+      url,
+      filename: buildFilename(url, folder),
+      saveAs: false,
+      conflictAction: "uniquify",
+    };
+    chrome.downloads.download(opts, (id) => {
+      if (chrome.runtime.lastError) {
+        console.warn("Download error:", chrome.runtime.lastError.message, url);
+        resolve(false);
+        return;
+      }
       resolve(id != null);
     });
   });
@@ -91,51 +100,85 @@ async function downloadOne(url, folder) {
 async function downloadBatch(items, folder) {
   let ok = 0;
   for (const item of items) {
-    const success = await downloadOne(item.url, folder);
-    if (success) ok++;
-    await new Promise((r) => setTimeout(r, 150));
+    if (await downloadOne(item.url, folder)) ok++;
+    // Small delay to avoid flooding the download manager
+    await new Promise((r) => setTimeout(r, 180));
   }
   return ok;
 }
 
-// ── Folder modal ──────────────────────────────────────────────────────────────
+// ── Modal ─────────────────────────────────────────────────────────────────────
 
-function openFolderModal(itemsToDownload) {
-  pendingDownloadItems = itemsToDownload;
-  $("modal-folder-input").value = getCurrentFolder();
+function openModal(prefill, cb) {
+  modalCallback = cb;
+  $("modal-folder-input").value = prefill;
   $("modal-overlay").classList.remove("hidden");
-  $("modal-folder-input").focus();
-  $("modal-folder-input").select();
+  setTimeout(() => {
+    $("modal-folder-input").focus();
+    $("modal-folder-input").select();
+  }, 50);
 }
 
-function closeFolderModal() {
+function closeModal() {
   $("modal-overlay").classList.add("hidden");
-  pendingDownloadItems = null;
+  modalCallback = null;
 }
 
-async function confirmModalDownload() {
+// Central confirm handler — registered once
+$("btn-modal-confirm").addEventListener("click", () => {
+  if (!modalCallback) return;
   const folder = sanitizeFolder($("modal-folder-input").value);
-  closeFolderModal();
+  const cb = modalCallback;
+  closeModal(); // clears modalCallback, but cb is already captured
 
-  // Sync back to main folder input
+  // Sync folder bar
   $("input-folder").value = folder;
   $("btn-clear-folder").style.display = folder ? "flex" : "none";
   saveFolder(folder);
 
-  if (!pendingDownloadItems) return;
-  await executeBatchDownload(pendingDownloadItems, folder);
-}
+  cb(folder);
+});
 
-// ── Trigger download (with folder check) ─────────────────────────────────────
+$("btn-modal-cancel").addEventListener("click", closeModal);
 
-async function triggerDownload(items) {
+$("modal-folder-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter")  $("btn-modal-confirm").click();
+  if (e.key === "Escape") closeModal();
+});
+
+$("modal-overlay").addEventListener("click", (e) => {
+  if (e.target === $("modal-overlay")) closeModal();
+});
+
+// ── Trigger helpers ───────────────────────────────────────────────────────────
+
+async function triggerBatchDownload(items) {
   const folder = getCurrentFolder();
   if (!folder) {
-    // Ask for folder before proceeding
-    openFolderModal(items);
+    openModal("", async (f) => {
+      await runBatch(items, f);
+    });
     return;
   }
-  await executeBatchDownload(items, folder);
+  await runBatch(items, folder);
+}
+
+async function runBatch(items, folder) {
+  const btn = $("btn-download-selected");
+  btn.disabled = true;
+  btn.innerHTML = `<div class="spinner" style="width:13px;height:13px;border-width:2px;margin:0 2px 0 0"></div>Téléchargement…`;
+
+  const ok = await downloadBatch(items, folder);
+  const dest = folder ? `Téléchargements/${folder}` : "Téléchargements";
+  showToast(`${ok} fichier(s) → ${dest}`, ok > 0 ? "success" : "error");
+
+  resetBatchButton();
+  // Deselect all cards
+  document.querySelectorAll(".media-card").forEach((c) => {
+    const chk = c.querySelector("input[type=checkbox]");
+    if (chk) { chk.checked = false; c.classList.remove("selected"); }
+  });
+  updateSelectedCount();
 }
 
 async function triggerSingleDownload(url, btnEl) {
@@ -149,68 +192,18 @@ async function triggerSingleDownload(url, btnEl) {
       btnEl.innerHTML = checkSvg();
     } else {
       btnEl.disabled = false;
-      showToast("Erreur lors du téléchargement", "error");
+      showToast("Erreur de téléchargement", "error");
     }
   }
 
   if (!folder) {
-    // Show modal for single download too
-    pendingDownloadItems = [{ url }];
-    $("modal-folder-input").value = "";
-    $("modal-overlay").classList.remove("hidden");
-    $("modal-folder-input").focus();
-
-    // Override confirm to handle single download
-    $("btn-modal-confirm").onclick = async () => {
-      const f = sanitizeFolder($("modal-folder-input").value);
-      closeFolderModal();
-      $("input-folder").value = f;
-      $("btn-clear-folder").style.display = f ? "flex" : "none";
-      saveFolder(f);
-      await doDownload(f);
-      // Restore normal confirm handler
-      $("btn-modal-confirm").onclick = confirmModalDownload;
-    };
+    openModal("", async (f) => { await doDownload(f); });
   } else {
     await doDownload(folder);
   }
 }
 
-async function executeBatchDownload(items, folder) {
-  const btn = $("btn-download-selected");
-  btn.disabled = true;
-  btn.innerHTML = `<div class="spinner" style="width:14px;height:14px;border-width:2px;margin:0"></div> Téléchargement…`;
-
-  const ok = await downloadBatch(items, folder);
-  const dest = folder ? `Téléchargements/${folder}` : "Téléchargements";
-  showToast(`${ok} fichier(s) → ${dest}`, "success");
-
-  resetDownloadButton();
-  // Deselect all
-  document.querySelectorAll(".media-card").forEach((c) => {
-    const chk = c.querySelector("input[type=checkbox]");
-    if (chk) { chk.checked = false; c.classList.remove("selected"); }
-  });
-  updateSelectedCount();
-}
-
-function checkSvg() {
-  return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>`;
-}
-
-function downloadSvg() {
-  return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
-}
-
-function resetDownloadButton() {
-  const btn = $("btn-download-selected");
-  btn.innerHTML = `${downloadSvg()} Télécharger (<span id="selected-count">0</span>)`;
-  btn.disabled = true;
-  $("chk-select-all").checked = false;
-  $("chk-select-all").indeterminate = false;
-}
-
-// ── Selection helpers ─────────────────────────────────────────────────────────
+// ── Selection ─────────────────────────────────────────────────────────────────
 
 function updateSelectedCount() {
   const checked = document.querySelectorAll(".media-card input[type=checkbox]:checked");
@@ -228,44 +221,40 @@ function updateSelectedCount() {
 // ── Render ────────────────────────────────────────────────────────────────────
 
 function getDisplayItems() {
-  const isImages = currentTab === "images";
+  const isImg = currentTab === "images";
   if (showMainOnly) {
-    return {
-      main: isImages ? data.mainImages : data.mainVideos,
-      secondary: [],
-    };
+    return { main: isImg ? data.mainImages : data.mainVideos, secondary: [] };
   }
-  const all = isImages ? data.images : data.videos;
-  const mainSet = new Set((isImages ? data.mainImages : data.mainVideos).map((i) => i.url));
+  const all = isImg ? data.images : data.videos;
+  const mainUrls = new Set((isImg ? data.mainImages : data.mainVideos).map((i) => i.url));
   return {
-    main: all.filter((i) => mainSet.has(i.url)),
-    secondary: all.filter((i) => !mainSet.has(i.url)),
+    main:      all.filter((i) =>  mainUrls.has(i.url)),
+    secondary: all.filter((i) => !mainUrls.has(i.url)),
   };
 }
 
-function makeCard(item, isSecondary = false) {
-  const isImage = currentTab === "images";
-  const name = filename(item.url);
+function makeCard(item, isSecondary) {
+  const isImg  = currentTab === "images";
+  const name   = filename(item.url);
 
-  const thumbHtml = isImage
-    ? `<img src="${item.url}" alt="" loading="lazy" onerror="this.parentElement.innerHTML='<svg width=22 height=22 viewBox=&quot;0 0 24 24&quot; fill=none stroke=currentColor stroke-width=1.5 opacity=.4><rect x=3 y=3 width=18 height=18 rx=2/><circle cx=8.5 cy=8.5 r=1.5/><polyline points=&quot;21 15 16 10 5 21&quot;/></svg>'">`
+  const thumbHtml = isImg
+    ? `<img src="${item.url}" alt="" loading="lazy" onerror="this.style.display='none'">`
     : item.poster
       ? `<img src="${item.poster}" alt="" loading="lazy"><div class="play-badge">▶</div>`
-      : `<svg class="video-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>`;
+      : `<svg class="video-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+           <polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/>
+         </svg>`;
 
-  let metaParts = [];
-  if (isImage) {
-    const rendered = item.renderedW && item.renderedH ? `${item.renderedW}×${item.renderedH}` : "";
-    const natural = item.naturalW && item.naturalH ? `${item.naturalW}×${item.naturalH}` : "";
-    if (rendered) metaParts.push(`affiché: ${rendered}`);
-    if (natural && natural !== rendered) metaParts.push(`natif: ${natural}`);
+  const metaParts = [];
+  if (isImg) {
+    if (item.renderedW && item.renderedH) metaParts.push(`${item.renderedW}×${item.renderedH}`);
+    if (item.naturalW && item.naturalH && `${item.naturalW}×${item.naturalH}` !== `${item.renderedW}×${item.renderedH}`)
+      metaParts.push(`natif: ${item.naturalW}×${item.naturalH}`);
   } else {
     const dur = formatDuration(item.duration);
     if (dur) metaParts.push(dur);
     if (item.renderedW && item.renderedH) metaParts.push(`${item.renderedW}×${item.renderedH}`);
   }
-
-  const mainBadge = !isSecondary ? `<span class="main-star">★ principal</span>` : "";
 
   const card = document.createElement("div");
   card.className = "media-card" + (isSecondary ? " secondary" : "");
@@ -276,26 +265,26 @@ function makeCard(item, isSecondary = false) {
     <div class="media-info">
       <div class="media-name-row">
         <div class="media-name" title="${item.url}">${name}</div>
-        ${mainBadge}
+        ${!isSecondary ? `<span class="main-star">★</span>` : ""}
       </div>
-      <div class="media-meta">${metaParts.join(" · ") || "media"}</div>
+      <div class="media-meta">${metaParts.join(" · ") || (isImg ? "image" : "vidéo")}</div>
     </div>
     <button class="btn-dl" title="Télécharger">${downloadSvg()}</button>
   `;
 
-  const chk = card.querySelector("input[type=checkbox]");
-  chk.addEventListener("change", () => {
-    card.classList.toggle("selected", chk.checked);
+  card.querySelector("input[type=checkbox]").addEventListener("change", (e) => {
+    card.classList.toggle("selected", e.target.checked);
     updateSelectedCount();
   });
 
-  const dlBtn = card.querySelector(".btn-dl");
-  dlBtn.addEventListener("click", () => triggerSingleDownload(item.url, dlBtn));
+  card.querySelector(".btn-dl").addEventListener("click", (e) => {
+    triggerSingleDownload(item.url, e.currentTarget);
+  });
 
   return card;
 }
 
-function sectionLabel(text, cls = "") {
+function sectionLabel(text, cls) {
   const el = document.createElement("div");
   el.className = `section-label ${cls}`;
   el.textContent = text;
@@ -307,26 +296,24 @@ function renderList() {
   list.innerHTML = "";
 
   const { main, secondary } = getDisplayItems();
-  const total = main.length + secondary.length;
 
-  if (total === 0) {
+  if (main.length === 0 && secondary.length === 0) {
+    const allCount = currentTab === "images" ? data.images.length : data.videos.length;
+    const hint = showMainOnly && allCount > 0
+      ? `<small>Essayez "Tout voir" pour afficher les ${allCount} médias détectés.</small>`
+      : "<small>Actualisez la page et réessayez.</small>";
     list.innerHTML = `<div class="empty">
-      <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3">
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3">
         <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
       </svg>
-      Aucun média${showMainOnly ? " principal" : ""} trouvé.<br>
-      ${showMainOnly && (currentTab === "images" ? data.images.length : data.videos.length) > 0
-        ? `<small>Essayez "Tout voir" pour afficher tous les médias.</small>`
-        : "<small>Actualisez la page et réessayez.</small>"}
+      Aucun média${showMainOnly ? " principal" : ""} trouvé.<br>${hint}
     </div>`;
-    resetDownloadButton();
+    resetBatchButton();
     return;
   }
 
   if (main.length > 0) {
-    if (secondary.length > 0) {
-      list.appendChild(sectionLabel(`Principaux (${main.length})`, "main-label"));
-    }
+    if (secondary.length > 0) list.appendChild(sectionLabel(`Principaux (${main.length})`, "main-label"));
     main.forEach((item) => list.appendChild(makeCard(item, false)));
   }
 
@@ -344,7 +331,7 @@ function updateCounts() {
 }
 
 function updateToggleBtn() {
-  const btn = $("btn-toggle-view");
+  const btn   = $("btn-toggle-view");
   const label = $("toggle-label");
   if (showMainOnly) {
     label.textContent = "Principaux";
@@ -357,11 +344,29 @@ function updateToggleBtn() {
   }
 }
 
-// ── Load media from active tab ────────────────────────────────────────────────
+// ── SVG helpers ───────────────────────────────────────────────────────────────
+
+function checkSvg() {
+  return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>`;
+}
+
+function downloadSvg() {
+  return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+}
+
+function resetBatchButton() {
+  const btn = $("btn-download-selected");
+  btn.innerHTML = `${downloadSvg()} Télécharger (<span id="selected-count">0</span>)`;
+  btn.disabled = true;
+  $("chk-select-all").checked = false;
+  $("chk-select-all").indeterminate = false;
+}
+
+// ── Load media ────────────────────────────────────────────────────────────────
 
 async function loadMedia() {
   $("media-list").innerHTML = `<div class="loading"><div class="spinner"></div>Analyse de la page…</div>`;
-  resetDownloadButton();
+  resetBatchButton();
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -373,16 +378,16 @@ async function loadMedia() {
 
     const result = await chrome.tabs.sendMessage(tab.id, { action: "getMedia" });
     data = {
-      images: result.images || [],
+      images:     result.images     || [],
       mainImages: result.mainImages || [],
-      videos: result.videos || [],
+      videos:     result.videos     || [],
       mainVideos: result.mainVideos || [],
     };
     updateCounts();
     renderList();
-  } catch {
+  } catch (err) {
     $("media-list").innerHTML = `<div class="empty">
-      <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3">
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3">
         <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
       </svg>
       Impossible d'analyser cette page.<br><small>Actualisez la page et réessayez.</small>
@@ -392,7 +397,6 @@ async function loadMedia() {
 
 // ── Event listeners ───────────────────────────────────────────────────────────
 
-// Tabs
 document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".tab[data-tab]").forEach((t) => t.classList.remove("active"));
@@ -402,21 +406,18 @@ document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
   });
 });
 
-// Main/All toggle
 $("btn-toggle-view").addEventListener("click", () => {
   showMainOnly = !showMainOnly;
   updateToggleBtn();
   renderList();
 });
 
-// Refresh
 $("btn-refresh").addEventListener("click", loadMedia);
 
-// Folder input
 $("input-folder").addEventListener("input", (e) => {
   const val = e.target.value.trim();
   $("btn-clear-folder").style.display = val ? "flex" : "none";
-  if (val) saveFolder(sanitizeFolder(val));
+  saveFolder(sanitizeFolder(val));
 });
 
 $("btn-clear-folder").addEventListener("click", () => {
@@ -425,38 +426,19 @@ $("btn-clear-folder").addEventListener("click", () => {
   saveFolder("");
 });
 
-// Select all
 $("chk-select-all").addEventListener("change", (e) => {
-  const checked = e.target.checked;
   document.querySelectorAll(".media-card").forEach((card) => {
     const chk = card.querySelector("input[type=checkbox]");
-    if (chk) { chk.checked = checked; card.classList.toggle("selected", checked); }
+    if (chk) { chk.checked = e.target.checked; card.classList.toggle("selected", e.target.checked); }
   });
   updateSelectedCount();
 });
 
-// Download selected
 $("btn-download-selected").addEventListener("click", async () => {
   const checked = document.querySelectorAll(".media-card input[type=checkbox]:checked");
   if (!checked.length) return;
   const items = Array.from(checked).map((chk) => ({ url: chk.dataset.url }));
-  await triggerDownload(items);
-});
-
-// Modal
-$("btn-modal-confirm").addEventListener("click", confirmModalDownload);
-$("btn-modal-cancel").addEventListener("click", () => {
-  closeFolderModal();
-  // Restore normal confirm handler in case it was overridden by single-download path
-  $("btn-modal-confirm").onclick = null;
-  $("btn-modal-confirm").addEventListener("click", confirmModalDownload);
-});
-$("modal-folder-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") $("btn-modal-confirm").click();
-  if (e.key === "Escape") $("btn-modal-cancel").click();
-});
-$("modal-overlay").addEventListener("click", (e) => {
-  if (e.target === $("modal-overlay")) $("btn-modal-cancel").click();
+  await triggerBatchDownload(items);
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
