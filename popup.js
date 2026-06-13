@@ -536,6 +536,17 @@ $("btn-download-selected").addEventListener("click", async () => {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
+// Clear any Referer rules left over from a previous session that closed
+// before cleanup (rules are persistent in declarativeNetRequest storage).
+chrome.declarativeNetRequest.getDynamicRules().then((rules) => {
+  if (rules.length) {
+    chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: rules.map((r) => r.id),
+      addRules: [],
+    }).catch(() => {});
+  }
+});
+
 updateToggleBtn();
 loadSavedFolder();
 loadMedia();
