@@ -7,9 +7,11 @@
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
+
+  <!-- ── Header ── -->
   <div class="header">
     <div class="logo">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
         <polyline points="7 10 12 15 17 10"/>
         <line x1="12" y1="15" x2="12" y2="3"/>
@@ -17,55 +19,77 @@
       DownloadEverything
     </div>
     <button id="btn-refresh" class="icon-btn" title="Actualiser">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <polyline points="23 4 23 10 17 10"/>
         <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
       </svg>
     </button>
   </div>
 
+  <!-- ── Folder bar ── -->
+  <div class="folder-bar">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="folder-icon">
+      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+    </svg>
+    <input
+      type="text"
+      id="input-folder"
+      placeholder="Dossier de destination (ex: Photos/Vacances)"
+      autocomplete="off"
+      spellcheck="false"
+    />
+    <button id="btn-clear-folder" class="icon-btn-sm" title="Effacer" style="display:none">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- ── Tabs ── -->
   <div class="tabs">
     <button class="tab active" data-tab="images">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <rect x="3" y="3" width="18" height="18" rx="2"/>
         <circle cx="8.5" cy="8.5" r="1.5"/>
         <polyline points="21 15 16 10 5 21"/>
       </svg>
-      Images <span id="count-images" class="badge">0</span>
+      Images
+      <span id="count-main-images" class="badge">0</span>
     </button>
     <button class="tab" data-tab="videos">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <polygon points="23 7 16 12 23 17 23 7"/>
         <rect x="1" y="5" width="15" height="14" rx="2"/>
       </svg>
-      Vidéos <span id="count-videos" class="badge">0</span>
+      Vidéos
+      <span id="count-main-videos" class="badge">0</span>
+    </button>
+    <!-- main/all toggle -->
+    <button id="btn-toggle-view" class="tab tab-toggle" title="Afficher tout">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <span id="toggle-label">Principaux</span>
     </button>
   </div>
 
+  <!-- ── Toolbar ── -->
   <div class="toolbar">
     <label class="select-all-label">
       <input type="checkbox" id="chk-select-all" />
       Tout sélectionner
     </label>
-    <div class="toolbar-actions">
-      <select id="min-size-filter" title="Taille minimale">
-        <option value="0">Toutes tailles</option>
-        <option value="50">≥ 50px</option>
-        <option value="100">≥ 100px</option>
-        <option value="200">≥ 200px</option>
-        <option value="500">≥ 500px</option>
-      </select>
-      <button id="btn-download-selected" class="btn-primary" disabled>
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-          <polyline points="7 10 12 15 17 10"/>
-          <line x1="12" y1="15" x2="12" y2="3"/>
-        </svg>
-        Télécharger (<span id="selected-count">0</span>)
-      </button>
-    </div>
+    <button id="btn-download-selected" class="btn-primary" disabled>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      Télécharger (<span id="selected-count">0</span>)
+    </button>
   </div>
 
+  <!-- ── Media list ── -->
   <div id="media-list" class="media-list">
     <div class="loading">
       <div class="spinner"></div>
@@ -73,6 +97,39 @@
     </div>
   </div>
 
+  <!-- ── Folder modal ── -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-title">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+        Choisir un dossier
+      </div>
+      <p class="modal-desc">Où voulez-vous enregistrer les fichiers ?<br><small>Chemin relatif à votre dossier Téléchargements.</small></p>
+      <input
+        type="text"
+        id="modal-folder-input"
+        class="modal-input"
+        placeholder="ex: Photos/Vacances 2025"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <div class="modal-actions">
+        <button id="btn-modal-cancel" class="btn-secondary">Annuler</button>
+        <button id="btn-modal-confirm" class="btn-primary">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Télécharger ici
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Toast ── -->
   <div id="toast" class="toast hidden"></div>
 
   <script src="popup.js"></script>
