@@ -86,8 +86,47 @@ async function getActiveTabId() {
   return _activeTabId;
 }
 
-// Content-script fallback: triggers download inside the page context so the
-// request carries the page's Referer and session cookies.
+async function getPageUrl() {
+  const tabId = await getActiveTabId();
+  if (tabId == null) return null;
+  try { return (await chrome.tabs.get(tabId)).url || null; } catch { return null; }
+}
+
+// Many CDNs (Erome, etc.) only serve media when the request carries the right
+// Referer.  Neither fetch() nor chrome.downloads can set Referer — it's a
+// forbidden header in both APIs.  declarativeNetRequest CAN, because it rewrites
+// headers at the network layer.  We add a temporary rule that forces the Referer
+// for requests to the media host, then fetch the file from the popup (extension
+// pages bypass CORS for hosts in host_permissions) and download the blob.
+const REFERER_RULE_ID = 1037;
+
+async function addRefererRule(host, referer) {
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [REFERER_RULE_ID],
+    addRules: [{
+      id: REFERER_RULE_ID,
+      priority: 1,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [{ header: "referer", operation: "set", value: referer }],
+      },
+      condition: {
+        requestDomains: [host],
+        resourceTypes: ["xmlhttprequest", "media", "image", "other", "main_frame", "sub_frame"],
+      },
+    }],
+  });
+}
+
+async function removeRefererRule() {
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [REFERER_RULE_ID] });
+  } catch {}
+}
+
+// Content-script fallback: fetch+blob+<a download> inside the page context, which
+// carries the page's Referer and cookies automatically.  Cannot target a chosen
+// sub-folder, but guarantees the file is saved when the primary path is blocked.
 async function downloadViaContentScript(url, folder) {
   try {
     const tabId = await getActiveTabId();
@@ -103,62 +142,42 @@ async function downloadViaContentScript(url, folder) {
   }
 }
 
-// Wait for a download to reach a terminal state (complete / interrupted).
-// Resolves with true on success, false on failure.
-// Times out after `ms` milliseconds and assumes success (avoids blocking forever).
-function waitForDownload(id, ms = 60_000) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      chrome.downloads.onChanged.removeListener(listener);
-      resolve(true); // timed out — assume in progress / success
-    }, ms);
+async function downloadOne(url, folder) {
+  let host = null;
+  try { host = new URL(url).hostname; } catch {}
 
-    function listener(delta) {
-      if (delta.id !== id) return;
-      const state = delta.state?.current;
-      if (state === "complete") {
-        clearTimeout(timer);
-        chrome.downloads.onChanged.removeListener(listener);
-        resolve(true);
-      } else if (state === "interrupted") {
-        clearTimeout(timer);
-        chrome.downloads.onChanged.removeListener(listener);
-        resolve(false);
-      }
+  // Primary path: DNR injects Referer → fetch from popup (CORS-exempt, sends
+  // cookies) → blob → chrome.downloads (so the chosen folder is respected).
+  if (host) {
+    const pageUrl = await getPageUrl();
+    let blob = null;
+    try {
+      if (pageUrl) await addRefererRule(host, pageUrl);
+      const resp = await fetch(url, { credentials: "include" });
+      if (resp.ok) blob = await resp.blob();
+    } catch (e) {
+      console.warn("Popup fetch failed:", e?.message, url);
+    } finally {
+      await removeRefererRule();
     }
 
-    chrome.downloads.onChanged.addListener(listener);
-  });
-}
-
-async function downloadOne(url, folder) {
-  // 1. Attempt chrome.downloads (supports folder targeting, shows in download bar).
-  const { id, startErr } = await new Promise((resolve) => {
-    chrome.downloads.download({
-      url,
-      filename: buildFilename(url, folder),
-      saveAs: false,
-      conflictAction: "uniquify",
-    }, (id) => {
-      resolve({ id, startErr: chrome.runtime.lastError?.message || null });
-    });
-  });
-
-  if (startErr || id == null) {
-    // Couldn't even start — go straight to fallback.
-    return downloadViaContentScript(url, folder);
+    // Reject empty bodies and HTML error pages masquerading as the file.
+    if (blob && blob.size > 0 && !/text\/html/i.test(blob.type)) {
+      const blobUrl = URL.createObjectURL(blob);
+      const { id, err } = await new Promise((resolve) => {
+        chrome.downloads.download({
+          url: blobUrl,
+          filename: buildFilename(url, folder),
+          saveAs: false,
+          conflictAction: "uniquify",
+        }, (id) => resolve({ id, err: chrome.runtime.lastError?.message || null }));
+      });
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 120_000);
+      if (id != null && !err) return true;
+    }
   }
 
-  // 2. Monitor the download. chrome.downloads returns a valid id even when the
-  //    server subsequently returns 404 — we must watch onChanged to detect that.
-  const success = await waitForDownload(id);
-  if (success) return true;
-
-  console.warn("chrome.downloads interrupted for:", url, "— using content-script fallback");
-
-  // 3. Fallback: page-context anchor click (correct Referer + cookies).
-  //    Note: folder targeting is best-effort for cross-origin resources because
-  //    browsers ignore the `download` attribute path for cross-origin URLs.
+  // Fallback: let the page download it (correct Referer + cookies, no folder).
   return downloadViaContentScript(url, folder);
 }
 
@@ -166,7 +185,7 @@ async function downloadBatch(items, folder) {
   let ok = 0;
   for (const item of items) {
     if (await downloadOne(item.url, folder)) ok++;
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 250));
   }
   return ok;
 }
@@ -506,6 +525,10 @@ $("btn-download-selected").addEventListener("click", async () => {
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+
+// Remove any Referer rule left behind if a previous popup closed mid-download
+// (dynamic rules persist in declarativeNetRequest storage).
+removeRefererRule();
 
 updateToggleBtn();
 loadSavedFolder();
