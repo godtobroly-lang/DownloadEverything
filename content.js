@@ -114,6 +114,15 @@ function collectMedia() {
   const IMAGE_EXTS = /\.(jpe?g|png|gif|webp|avif|bmp|tiff?|svg)(\?.*)?$/i;
   const VIDEO_EXTS = /\.(mp4|webm|ogg|ogv|mov|avi|mkv|flv|wmv|m4v|ts|m3u8|mpd)(\?.*)?$/i;
 
+  // URLs that look like streaming platform pages — not directly downloadable files.
+  // Matches YouTube watch/embed/shorts, Vimeo pages, Dailymotion, Twitch clips, etc.
+  const STREAMING_PAGE_PAT = /\b(youtube\.com\/(watch|embed|shorts|live)|youtu\.be\/|player\.vimeo\.com\/|vimeo\.com\/(video\/\d+|channels|groups|album)|dailymotion\.com\/(video|embed\/video)|twitch\.tv\/|facebook\.com\/watch|instagram\.com\/reel)\b/i;
+
+  function isStreamingPage(url) {
+    // Only exclude if the URL has no direct video file extension AND matches a streaming platform
+    return !VIDEO_EXTS.test(url) && STREAMING_PAGE_PAT.test(url);
+  }
+
   document.querySelectorAll("a[href]").forEach((a) => {
     const href = abs(a.href);
     if (!href) return;
@@ -126,23 +135,30 @@ function collectMedia() {
 
   const vidMap = new Map();
 
+  // Tracks which URLs came from a real <video> element (for isMain override)
+  const fromVideoElement = new Set();
+
   function addVid(url, entry) {
-    if (!url || vidMap.has(url)) return;
+    if (!url || isStreamingPage(url)) return;
+    if (vidMap.has(url)) return;
     vidMap.set(url, { ...entry, url });
   }
 
   // --- <video> elements ---
+  // Any URL found in a <video> element is treated as "main" regardless of
+  // rendered dimensions — the player may be off-screen or not yet laid out
+  // (common with lazy-loading and single-page apps like Erome).
   document.querySelectorAll("video").forEach((el) => {
     const rect = el.getBoundingClientRect();
     const rw = rect.width, rh = rect.height;
-    const score = (rw * rh / vpArea) * 100;
-    const isMain = rw >= 200 && rh >= 100;
-    const poster = abs(el.poster) || abs(el.getAttribute("poster")) || "";
+    // Score still reflects visible size for sorting, but isMain is always true
+    // for <video>-sourced URLs so they're never hidden in the default view.
+    const score = Math.max((rw * rh / vpArea) * 100, 10); // floor at 10 so they sort above script-found
+    const poster   = abs(el.poster) || abs(el.getAttribute("poster")) || "";
     const duration = isFinite(el.duration) ? el.duration : 0;
+    const base     = { poster, duration, renderedW: Math.round(rw), renderedH: Math.round(rh), score, isMain: true };
 
-    const base = { poster, duration, renderedW: Math.round(rw), renderedH: Math.round(rh), score, isMain };
-
-    // Gather all candidate source URLs from every possible attribute
+    // Every possible place a video source URL can live
     const raw = [
       el.getAttribute("src"),
       el.src,
@@ -154,31 +170,35 @@ function collectMedia() {
       el.dataset.webm,
       el.dataset.hlsSrc,
       el.dataset.manifest,
-      el.getAttribute("data-setup") && (() => {
-        try { return JSON.parse(el.getAttribute("data-setup")).sources?.[0]?.src; } catch { return null; }
+      el.dataset.file,       // JW Player
+      el.dataset.source,
+      (() => {
+        try { return JSON.parse(el.getAttribute("data-setup") || "{}").sources?.[0]?.src; } catch { return null; }
       })(),
     ];
 
-    // Also check <source> children
     el.querySelectorAll("source").forEach((s) => {
-      raw.push(s.getAttribute("src"), s.src, s.dataset.src, s.dataset.srcMp4);
+      raw.push(s.getAttribute("src"), s.src, s.dataset.src, s.dataset.srcMp4, s.dataset.srcWebm);
     });
 
-    // Resolve and deduplicate
     const seen = new Set();
     raw.forEach((v) => {
       const u = abs(v);
       if (u && !seen.has(u)) {
         seen.add(u);
+        fromVideoElement.add(u);
         addVid(u, base);
       }
     });
   });
 
-  // --- og:video ---
+  // --- og:video (only if not a streaming platform page URL) ---
   document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"]').forEach((meta) => {
     const url = abs(meta.getAttribute("content"));
-    if (url) addVid(url, { poster: "", duration: 0, renderedW: 0, renderedH: 0, score: 50, isMain: true });
+    // og:video often points to embed pages on YouTube/Vimeo — skip those
+    if (url && !isStreamingPage(url)) {
+      addVid(url, { poster: "", duration: 0, renderedW: 0, renderedH: 0, score: 50, isMain: true });
+    }
   });
 
   // --- JSON-LD VideoObject ---
@@ -206,14 +226,17 @@ function collectMedia() {
   });
 
   // --- Inline <script> tags: extract video URL literals ---
-  // Matches quoted URLs ending in known video extensions (covers most player configs)
+  // Only matches URLs with explicit video extensions to avoid false positives.
+  // URLs already found in a <video> element are skipped (deduplicated by addVid).
   const INLINE_VID_PAT = /["'`](https?:\/\/[^"'`\s]{4,}\.(mp4|webm|m3u8|mpd|ogg|ogv|mov|m4v|ts)(?:\?[^"'`\s]*)?)[`'"]/g;
   document.querySelectorAll("script:not([src])").forEach((script) => {
     for (const m of script.textContent.matchAll(INLINE_VID_PAT)) {
       const url = abs(m[1]);
-      if (url && !vidMap.has(url)) {
-        addVid(url, { poster: "", duration: 0, renderedW: 0, renderedH: 0, score: 5, isMain: false });
-      }
+      if (!url || vidMap.has(url)) continue;
+      // If this URL was already seen via a <video> element, skip (addVid deduplicates)
+      // Mark as main only if it came from a <video> element
+      const isMain = fromVideoElement.has(url);
+      addVid(url, { poster: "", duration: 0, renderedW: 0, renderedH: 0, score: isMain ? 10 : 5, isMain });
     }
   });
 
