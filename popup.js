@@ -78,30 +78,61 @@ function getCurrentFolder() {
 
 // ── Download ──────────────────────────────────────────────────────────────────
 
+// Get the currently active tab (cached for the session).
+let _activeTabId = null;
+async function getActiveTabId() {
+  if (_activeTabId != null) return _activeTabId;
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  _activeTabId = tab?.id ?? null;
+  return _activeTabId;
+}
+
+// Ask the content script to download via a page-context <a download> click.
+// This carries the page's Referer and session cookies, which chrome.downloads
+// does NOT send — bypassing hotlink protection on most CDNs.
+async function downloadViaContentScript(url) {
+  try {
+    const tabId = await getActiveTabId();
+    if (tabId == null) return false;
+    const resp = await chrome.tabs.sendMessage(tabId, {
+      action: "downloadViaLink",
+      url,
+      filename: filename(url),
+    });
+    return resp?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
 async function downloadOne(url, folder) {
-  return new Promise((resolve) => {
-    const opts = {
+  // 1. Try chrome.downloads first (allows folder targeting, shows in download bar)
+  const { id, err } = await new Promise((resolve) => {
+    chrome.downloads.download({
       url,
       filename: buildFilename(url, folder),
       saveAs: false,
       conflictAction: "uniquify",
-    };
-    chrome.downloads.download(opts, (id) => {
-      if (chrome.runtime.lastError) {
-        console.warn("Download error:", chrome.runtime.lastError.message, url);
-        resolve(false);
-        return;
-      }
-      resolve(id != null);
+    }, (id) => {
+      // lastError must be read synchronously inside the callback
+      const err = chrome.runtime.lastError?.message || null;
+      resolve({ id, err });
     });
   });
+
+  if (!err && id != null) return true;
+
+  console.warn(`chrome.downloads failed (${err}) — trying content-script fallback for:`, url);
+
+  // 2. Fallback: content script <a download> click (correct Referer/cookies,
+  //    but folder targeting is not guaranteed for cross-origin resources).
+  return downloadViaContentScript(url);
 }
 
 async function downloadBatch(items, folder) {
   let ok = 0;
   for (const item of items) {
     if (await downloadOne(item.url, folder)) ok++;
-    // Small delay to avoid flooding the download manager
     await new Promise((r) => setTimeout(r, 180));
   }
   return ok;
