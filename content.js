@@ -275,26 +275,56 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
-  // Download via fetch+blob in the page context.
-  // The popup sets a declarativeNetRequest Referer rule before sending this
-  // message, so the fetch carries the correct Referer for CDN hotlink checks.
-  // sendResponse is called synchronously (ok:true = "started") so the popup
-  // can close immediately; the fetch continues in the background.
+  // Download via fetch+blob in the page context, reporting live progress to
+  // chrome.storage.local under key "dl_<id>" so the popup can show status even
+  // after it is closed. The popup sets a declarativeNetRequest Referer+CORS rule
+  // before sending this message. sendResponse is synchronous (ok:true =
+  // "started") so the popup can close immediately.
   if (msg.action === "downloadBlob") {
-    // If another listener instance is already handling this URL, ack and skip.
     if (_activeDownloads.has(msg.url)) { sendResponse({ ok: true }); return false; }
     _activeDownloads.add(msg.url);
+    sendResponse({ ok: true });
 
-    sendResponse({ ok: true });   // immediate — popup can close
+    const id   = msg.id;
+    const name = (msg.filename || "").split("/").pop() || "media";
+    const key  = "dl_" + id;
+    const setStatus = (patch) =>
+      chrome.storage.local.set({ [key]: { id, name, url: msg.url, ts: Date.now(), ...patch } });
 
     (async () => {
       try {
+        setStatus({ state: "fetching", received: 0, total: 0 });
+
         const resp = await fetch(msg.url, { credentials: "include" });
-        if (!resp.ok) return;
+        if (!resp.ok) { setStatus({ state: "error", error: "HTTP " + resp.status, received: 0, total: 0 }); return; }
+
         const ct = resp.headers.get("content-type") || "";
-        if (/text\/html/i.test(ct)) return;
-        const blob = await resp.blob();
-        if (!blob.size) return;
+        if (/text\/html/i.test(ct)) { setStatus({ state: "error", error: "Page HTML (protégé)", received: 0, total: 0 }); return; }
+
+        const total = +(resp.headers.get("content-length") || 0);
+
+        // Stream the body so we can report progress during the (often long) fetch.
+        let blob;
+        if (resp.body && resp.body.getReader) {
+          const reader = resp.body.getReader();
+          const chunks = [];
+          let received = 0, lastWrite = 0;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.length;
+            const now = Date.now();
+            if (now - lastWrite > 250) { lastWrite = now; setStatus({ state: "fetching", received, total }); }
+          }
+          blob = new Blob(chunks, { type: ct });
+        } else {
+          blob = await resp.blob();
+        }
+
+        if (!blob.size) { setStatus({ state: "error", error: "Fichier vide", received: 0, total: 0 }); return; }
+
+        setStatus({ state: "saving", received: blob.size, total: blob.size });
 
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -303,9 +333,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         a.style.display = "none";
         (document.body || document.documentElement).appendChild(a);
         a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-
         setTimeout(() => { try { a.remove(); URL.revokeObjectURL(blobUrl); } catch {} }, 120_000);
-      } catch {
+
+        setStatus({ state: "done", received: blob.size, total: blob.size });
+      } catch (e) {
+        setStatus({ state: "error", error: String((e && e.message) || e), received: 0, total: 0 });
       } finally {
         _activeDownloads.delete(msg.url);
       }

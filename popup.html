@@ -18,12 +18,22 @@
       </svg>
       DownloadEverything
     </div>
-    <button id="btn-refresh" class="icon-btn" title="Actualiser">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <polyline points="23 4 23 10 17 10"/>
-        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-      </svg>
-    </button>
+    <div class="header-actions">
+      <button id="btn-downloads" class="icon-btn" title="Téléchargements">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        <span id="dl-active-count" class="icon-badge hidden">0</span>
+      </button>
+      <button id="btn-refresh" class="icon-btn" title="Actualiser">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+      </button>
+    </div>
   </div>
 
   <!-- ── Folder bar ── -->
@@ -97,36 +107,27 @@
     </div>
   </div>
 
-  <!-- ── Folder modal ── -->
-  <div id="modal-overlay" class="modal-overlay hidden">
-    <div class="modal">
-      <div class="modal-title">
+  <!-- ── Downloads panel ── -->
+  <div id="downloads-panel" class="dl-panel">
+    <div class="dl-panel-head">
+      <div class="dl-panel-title">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
         </svg>
-        Choisir un dossier
+        Téléchargements
       </div>
-      <p class="modal-desc">Où voulez-vous enregistrer les fichiers ?<br><small>Chemin relatif à votre dossier Téléchargements. Laissez vide pour y enregistrer directement.</small></p>
-      <input
-        type="text"
-        id="modal-folder-input"
-        class="modal-input"
-        placeholder="ex: Photos/Vacances 2025"
-        autocomplete="off"
-        spellcheck="false"
-      />
-      <div class="modal-actions">
-        <button id="btn-modal-cancel" class="btn-secondary">Annuler</button>
-        <button id="btn-modal-confirm" class="btn-primary">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="7 10 12 15 17 10"/>
-            <line x1="12" y1="15" x2="12" y2="3"/>
+      <div class="dl-panel-actions">
+        <button id="btn-dl-clear" class="btn-secondary btn-sm" title="Effacer les terminés">Effacer</button>
+        <button id="btn-dl-close" class="icon-btn" title="Fermer">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
-          Télécharger ici
         </button>
       </div>
     </div>
+    <div id="dl-list" class="dl-list"></div>
   </div>
 
   <!-- ── Toast ── -->

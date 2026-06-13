@@ -6,9 +6,6 @@ let data = { images: [], mainImages: [], videos: [], mainVideos: [] };
 let currentTab   = "images";
 let showMainOnly = true;
 
-// Single modal callback — avoids mixed onclick/addEventListener conflicts
-let modalCallback = null;
-
 const $ = (id) => document.getElementById(id);
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -135,6 +132,10 @@ async function removeRefererRule() {
   } catch {}
 }
 
+function newDownloadId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
 async function downloadOne(url, folder) {
   const tabId  = await getActiveTabId();
   if (!tabId) return false;
@@ -149,24 +150,34 @@ async function downloadOne(url, folder) {
     await addRefererRule(host, pageUrl);
   }
 
+  const id   = newDownloadId();
+  const base = filename(url);
+  const full = buildFilename(url, folder);
+
+  // Optimistic status entry so the download shows in the panel immediately.
+  chrome.storage.local.set({ ["dl_" + id]: { id, name: base, url, state: "queued", received: 0, total: 0, ts: Date.now() } });
+
   // The content script responds immediately (ok:true = "started"), then
   // continues the fetch+blob+<a download> in the background — so this popup
   // can be closed at any time without cancelling the download.
   const started = await new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, {
       action: "downloadBlob",
+      id,
       url,
-      filename: buildFilename(url, folder),
+      filename: full,
     }, (resp) => {
       if (chrome.runtime.lastError || !resp?.ok) { resolve(false); return; }
       resolve(true);
     });
   });
 
-  // If content script couldn't be reached, clean up rule immediately.
-  if (!started) { await removeRefererRule(); }
-  // Otherwise, the rule stays until next popup open (content script fetch may
-  // still be in flight); removeRefererRule() in init handles cleanup.
+  if (!started) {
+    chrome.storage.local.set({ ["dl_" + id]: { id, name: base, url, state: "error", error: "Onglet inaccessible", received: 0, total: 0, ts: Date.now() } });
+    await removeRefererRule();
+  }
+  // On success the rule stays until next popup open (fetch may still be in
+  // flight); removeRefererRule() in init handles cleanup.
   return started;
 }
 
@@ -179,60 +190,12 @@ async function downloadBatch(items, folder) {
   return ok;
 }
 
-// ── Modal ─────────────────────────────────────────────────────────────────────
-
-function openModal(prefill, cb) {
-  modalCallback = cb;
-  $("modal-folder-input").value = prefill;
-  $("modal-overlay").classList.remove("hidden");
-  setTimeout(() => {
-    $("modal-folder-input").focus();
-    $("modal-folder-input").select();
-  }, 50);
-}
-
-function closeModal() {
-  $("modal-overlay").classList.add("hidden");
-  modalCallback = null;
-}
-
-// Central confirm handler — registered once
-$("btn-modal-confirm").addEventListener("click", () => {
-  if (!modalCallback) return;
-  const folder = sanitizeFolder($("modal-folder-input").value);
-  const cb = modalCallback;
-  closeModal(); // clears modalCallback, but cb is already captured
-
-  // Sync folder bar
-  $("input-folder").value = folder;
-  $("btn-clear-folder").style.display = folder ? "flex" : "none";
-  saveFolder(folder);
-
-  cb(folder);
-});
-
-$("btn-modal-cancel").addEventListener("click", closeModal);
-
-$("modal-folder-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter")  $("btn-modal-confirm").click();
-  if (e.key === "Escape") closeModal();
-});
-
-$("modal-overlay").addEventListener("click", (e) => {
-  if (e.target === $("modal-overlay")) closeModal();
-});
-
 // ── Trigger helpers ───────────────────────────────────────────────────────────
+// The folder bar at the top is the persistent destination; downloads always use
+// it directly (saved in chrome.storage), so the user is never re-prompted.
 
 async function triggerBatchDownload(items) {
-  const folder = getCurrentFolder();
-  if (!folder) {
-    openModal("", async (f) => {
-      await runBatch(items, f);
-    });
-    return;
-  }
-  await runBatch(items, folder);
+  await runBatch(items, getCurrentFolder());
 }
 
 async function runBatch(items, folder) {
@@ -242,7 +205,7 @@ async function runBatch(items, folder) {
 
   const ok = await downloadBatch(items, folder);
   const dest = folder ? `Téléchargements/${folder}` : "Téléchargements";
-  showToast(`${ok} fichier(s) → ${dest}`, ok > 0 ? "success" : "error");
+  showToast(`${ok} téléchargement(s) lancé(s) → ${dest}`, ok > 0 ? "success" : "error");
 
   resetBatchButton();
   // Deselect all cards
@@ -254,24 +217,81 @@ async function runBatch(items, folder) {
 }
 
 async function triggerSingleDownload(url, btnEl) {
-  const folder = getCurrentFolder();
+  btnEl.disabled = true;
+  const ok = await downloadOne(url, getCurrentFolder());
+  if (ok) {
+    btnEl.classList.add("done");
+    btnEl.innerHTML = checkSvg();
+  } else {
+    btnEl.disabled = false;
+    showToast("Erreur de téléchargement", "error");
+  }
+}
 
-  async function doDownload(f) {
-    btnEl.disabled = true;
-    const ok = await downloadOne(url, f);
-    if (ok) {
-      btnEl.classList.add("done");
-      btnEl.innerHTML = checkSvg();
-    } else {
-      btnEl.disabled = false;
-      showToast("Erreur de téléchargement", "error");
-    }
+// ── Downloads status panel ──────────────────────────────────────────────────────
+
+function formatBytes(b) {
+  if (!b || b < 0) return "0 o";
+  const u = ["o", "Ko", "Mo", "Go"];
+  let n = b, i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i === 0 ? 0 : (n < 10 ? 1 : 0))} ${u[i]}`;
+}
+
+const DL_STATE_LABEL = {
+  queued:   "En attente…",
+  fetching: "Téléchargement…",
+  saving:   "Enregistrement…",
+  done:     "Terminé",
+  error:    "Échec",
+};
+
+function renderDlItem(e) {
+  const pct   = e.total ? Math.min(100, Math.round((e.received / e.total) * 100)) : 0;
+  const indet = (e.state === "fetching" || e.state === "queued") && !e.total;
+  const badge = e.state === "done" ? "✓" : e.state === "error" ? "✕" : (e.total ? pct + "%" : "");
+  const sub   = e.state === "error"
+    ? (e.error || "Erreur")
+    : e.total
+      ? `${formatBytes(e.received)} / ${formatBytes(e.total)}`
+      : (e.received ? formatBytes(e.received) : DL_STATE_LABEL[e.state] || "");
+  const fillW = e.state === "done" ? 100 : pct;
+
+  return `<div class="dl-item state-${e.state}">
+    <div class="dl-item-top">
+      <span class="dl-name" title="${e.name}">${e.name}</span>
+      <span class="dl-pct">${badge}</span>
+    </div>
+    <div class="dl-bar ${indet ? "indeterminate" : ""}"><div class="dl-bar-fill" style="width:${fillW}%"></div></div>
+    <div class="dl-sub">${sub}</div>
+  </div>`;
+}
+
+async function refreshDownloads() {
+  const all = await chrome.storage.local.get(null);
+  const entries = Object.keys(all)
+    .filter((k) => k.startsWith("dl_"))
+    .map((k) => all[k])
+    .filter(Boolean)
+    .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+
+  const list = $("dl-list");
+  if (list) {
+    list.innerHTML = entries.length
+      ? entries.map(renderDlItem).join("")
+      : `<div class="empty">
+           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3">
+             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+           </svg>
+           Aucun téléchargement pour l'instant.
+         </div>`;
   }
 
-  if (!folder) {
-    openModal("", async (f) => { await doDownload(f); });
-  } else {
-    await doDownload(folder);
+  const active = entries.filter((e) => e.state === "fetching" || e.state === "saving" || e.state === "queued").length;
+  const badge  = $("dl-active-count");
+  if (badge) {
+    badge.textContent = active;
+    badge.classList.toggle("hidden", active === 0);
   }
 }
 
@@ -513,6 +533,29 @@ $("btn-download-selected").addEventListener("click", async () => {
   await triggerBatchDownload(items);
 });
 
+// Downloads panel
+$("btn-downloads").addEventListener("click", () => {
+  $("downloads-panel").classList.toggle("open");
+  refreshDownloads();
+});
+
+$("btn-dl-close").addEventListener("click", () => {
+  $("downloads-panel").classList.remove("open");
+});
+
+$("btn-dl-clear").addEventListener("click", async () => {
+  const all  = await chrome.storage.local.get(null);
+  const done = Object.keys(all).filter((k) => k.startsWith("dl_") && ["done", "error"].includes(all[k]?.state));
+  if (done.length) await chrome.storage.local.remove(done);
+  refreshDownloads();
+});
+
+// Live status updates — content script writes dl_<id> entries as downloads progress.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (Object.keys(changes).some((k) => k.startsWith("dl_"))) refreshDownloads();
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 // Remove any Referer rule left behind if a previous popup closed mid-download
@@ -522,3 +565,4 @@ removeRefererRule();
 updateToggleBtn();
 loadSavedFolder();
 loadMedia();
+refreshDownloads();
