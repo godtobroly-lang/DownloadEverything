@@ -263,6 +263,12 @@ function collectMedia() {
 
 // ── Message handler ───────────────────────────────────────────────────────────
 
+// Guard against duplicate downloads: content.js can be injected multiple times
+// (manifest + executeScript in loadMedia), which creates multiple listeners.
+// Without this set, every listener instance would start its own fetch for the
+// same URL, resulting in multiple copies of the file being saved.
+const _activeDownloads = new Set();
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "getMedia") {
     sendResponse(collectMedia());
@@ -275,6 +281,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // sendResponse is called synchronously (ok:true = "started") so the popup
   // can close immediately; the fetch continues in the background.
   if (msg.action === "downloadBlob") {
+    // If another listener instance is already handling this URL, ack and skip.
+    if (_activeDownloads.has(msg.url)) { sendResponse({ ok: true }); return false; }
+    _activeDownloads.add(msg.url);
+
     sendResponse({ ok: true });   // immediate — popup can close
 
     (async () => {
@@ -282,7 +292,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const resp = await fetch(msg.url, { credentials: "include" });
         if (!resp.ok) return;
         const ct = resp.headers.get("content-type") || "";
-        if (/text\/html/i.test(ct)) return;      // reject CDN error pages
+        if (/text\/html/i.test(ct)) return;
         const blob = await resp.blob();
         if (!blob.size) return;
 
@@ -295,9 +305,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
 
         setTimeout(() => { try { a.remove(); URL.revokeObjectURL(blobUrl); } catch {} }, 120_000);
-      } catch {}
+      } catch {
+      } finally {
+        _activeDownloads.delete(msg.url);
+      }
     })();
 
-    return false;  // sendResponse already called synchronously
+    return false;
   }
 });

@@ -149,9 +149,6 @@ async function downloadOne(url, folder) {
     await addRefererRule(host, pageUrl);
   }
 
-  // Inject latest content.js in case the tab was open before extension reload.
-  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] }).catch(() => {});
-
   // The content script responds immediately (ok:true = "started"), then
   // continues the fetch+blob+<a download> in the background — so this popup
   // can be closed at any time without cancelling the download.
