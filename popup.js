@@ -92,102 +92,44 @@ async function getPageUrl() {
   try { return (await chrome.tabs.get(tabId)).url || null; } catch { return null; }
 }
 
-// ── declarativeNetRequest Referer injection ───────────────────────────────────
-// chrome.downloads does NOT send a Referer header, so CDNs with hotlink
-// protection return 403/404. We inject the correct Referer via a short-lived
-// dynamic rule and remove it as soon as the download is no longer in_progress.
-
-let _ruleCounter = 1000;
-
-async function addRefererRule(targetUrl, referer) {
-  const host = new URL(targetUrl).hostname;
-  const id = ++_ruleCounter;
-  try {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [],
-      addRules: [{
-        id,
-        priority: 10,
-        action: {
-          type: "modifyHeaders",
-          requestHeaders: [{ header: "Referer", operation: "set", value: referer }],
-        },
-        condition: {
-          urlFilter: `||${host}^`,
-          resourceTypes: ["xmlhttprequest", "media", "other", "main_frame", "sub_frame"],
-        },
-      }],
-    });
-    return id;
-  } catch (e) {
-    console.warn("declarativeNetRequest rule failed:", e);
-    return null;
-  }
-}
-
-async function removeRefererRule(ruleId) {
-  if (!ruleId) return;
-  try { await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId], addRules: [] }); } catch {}
-}
-
-// ── Wait for download terminal state ─────────────────────────────────────────
-
-function waitForDownload(id, ms = 120_000) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      chrome.downloads.onChanged.removeListener(listener);
-      resolve(true); // assume still downloading (large file)
-    }, ms);
-
-    function listener(delta) {
-      if (delta.id !== id) return;
-      const state = delta.state?.current;
-      if (state === "complete") {
-        clearTimeout(timer);
-        chrome.downloads.onChanged.removeListener(listener);
-        resolve(true);
-      } else if (state === "interrupted") {
-        clearTimeout(timer);
-        chrome.downloads.onChanged.removeListener(listener);
-        resolve(false);
-      }
-    }
-
-    chrome.downloads.onChanged.addListener(listener);
-  });
-}
-
-// ── Main download function ────────────────────────────────────────────────────
+// Extension popup pages have two privileges web pages don't:
+//   1. Cross-origin fetch is allowed for all URLs in host_permissions (<all_urls>)
+//      — CORS headers on the CDN are irrelevant.
+//   2. The Referer header can be set explicitly (not a forbidden header here).
+// We fetch the file, turn it into a blob URL in the extension context, and pass
+// that blob URL to chrome.downloads — which saves it with the correct path.
+// This bypasses CDN hotlink protection without opening extra tabs.
 
 async function downloadOne(url, folder) {
-  // Inject the correct Referer so CDNs with hotlink protection accept the request.
   const pageUrl = await getPageUrl();
-  const ruleId  = pageUrl ? await addRefererRule(url, pageUrl) : null;
 
   try {
-    const { id, startErr } = await new Promise((resolve) => {
+    const resp = await fetch(url, {
+      credentials: "include",                              // sends cookies for the CDN domain
+      headers: pageUrl ? { Referer: pageUrl } : {},       // correct Referer for hotlink checks
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+    const blob   = await resp.blob();
+    const blobUrl = URL.createObjectURL(blob);
+
+    const { id, err } = await new Promise((resolve) => {
       chrome.downloads.download({
-        url,
+        url: blobUrl,
         filename: buildFilename(url, folder),
         saveAs: false,
         conflictAction: "uniquify",
       }, (id) => {
-        resolve({ id, startErr: chrome.runtime.lastError?.message || null });
+        resolve({ id, err: chrome.runtime.lastError?.message || null });
       });
     });
 
-    if (startErr || id == null) {
-      // Failed to queue — Referer injection alone won't help; bail.
-      return false;
-    }
-
-    // Wait for completion. The id is valid even when the CDN later rejects the
-    // request — onChanged with state="interrupted" is the only reliable signal.
-    return await waitForDownload(id);
-  } finally {
-    // Rule is removed after download completes/fails. For large files that are
-    // still in_progress when we time out, leave the rule a bit longer.
-    setTimeout(() => removeRefererRule(ruleId), 5000);
+    // Keep blob alive long enough for chrome.downloads to buffer it, then free RAM.
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    return id != null && !err;
+  } catch (e) {
+    console.warn("Download failed:", e.message, url);
+    return false;
   }
 }
 
@@ -195,7 +137,7 @@ async function downloadBatch(items, folder) {
   let ok = 0;
   for (const item of items) {
     if (await downloadOne(item.url, folder)) ok++;
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 300));
   }
   return ok;
 }
@@ -535,17 +477,6 @@ $("btn-download-selected").addEventListener("click", async () => {
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-
-// Clear any Referer rules left over from a previous session that closed
-// before cleanup (rules are persistent in declarativeNetRequest storage).
-chrome.declarativeNetRequest.getDynamicRules().then((rules) => {
-  if (rules.length) {
-    chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: rules.map((r) => r.id),
-      addRules: [],
-    }).catch(() => {});
-  }
-});
 
 updateToggleBtn();
 loadSavedFolder();
