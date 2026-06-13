@@ -86,51 +86,27 @@ async function getActiveTabId() {
   return _activeTabId;
 }
 
-async function getPageUrl() {
-  const tabId = await getActiveTabId();
-  if (tabId == null) return null;
-  try { return (await chrome.tabs.get(tabId)).url || null; } catch { return null; }
-}
-
-// Extension popup pages have two privileges web pages don't:
-//   1. Cross-origin fetch is allowed for all URLs in host_permissions (<all_urls>)
-//      — CORS headers on the CDN are irrelevant.
-//   2. The Referer header can be set explicitly (not a forbidden header here).
-// We fetch the file, turn it into a blob URL in the extension context, and pass
-// that blob URL to chrome.downloads — which saves it with the correct path.
-// This bypasses CDN hotlink protection without opening extra tabs.
-
+// Delegate the actual fetch+download to the content script running in the page.
+// Benefits over fetching in the popup:
+//   • The request carries page cookies + automatic Referer (page URL) — bypasses CDN hotlink checks.
+//   • The blob URL created in the content script is same-origin with the page, so
+//     the <a download> trick works (Chrome only respects `download` for same-origin URLs).
+//   • The content script keeps running after the popup closes, so large files download fully.
 async function downloadOne(url, folder) {
-  const pageUrl = await getPageUrl();
+  const tabId = await getActiveTabId();
+  if (tabId == null) return false;
 
-  try {
-    const resp = await fetch(url, {
-      credentials: "include",                              // sends cookies for the CDN domain
-      headers: pageUrl ? { Referer: pageUrl } : {},       // correct Referer for hotlink checks
+  const fname = buildFilename(url, folder);
+
+  // Ensure content script is loaded (may not be injected on first open)
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] }).catch(() => {});
+
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { action: "downloadBlob", url, filename: fname }, (resp) => {
+      if (chrome.runtime.lastError || !resp?.ok) { resolve(false); return; }
+      resolve(true);
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-    const blob   = await resp.blob();
-    const blobUrl = URL.createObjectURL(blob);
-
-    const { id, err } = await new Promise((resolve) => {
-      chrome.downloads.download({
-        url: blobUrl,
-        filename: buildFilename(url, folder),
-        saveAs: false,
-        conflictAction: "uniquify",
-      }, (id) => {
-        resolve({ id, err: chrome.runtime.lastError?.message || null });
-      });
-    });
-
-    // Keep blob alive long enough for chrome.downloads to buffer it, then free RAM.
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-    return id != null && !err;
-  } catch (e) {
-    console.warn("Download failed:", e.message, url);
-    return false;
-  }
+  });
 }
 
 async function downloadBatch(items, folder) {
