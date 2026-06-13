@@ -86,25 +86,49 @@ async function getActiveTabId() {
   return _activeTabId;
 }
 
-// Delegate the actual fetch+download to the content script running in the page.
-// Benefits over fetching in the popup:
-//   • The request carries page cookies + automatic Referer (page URL) — bypasses CDN hotlink checks.
-//   • The blob URL created in the content script is same-origin with the page, so
-//     the <a download> trick works (Chrome only respects `download` for same-origin URLs).
-//   • The content script keeps running after the popup closes, so large files download fully.
-async function downloadOne(url, folder) {
+async function getPageUrl() {
   const tabId = await getActiveTabId();
-  if (tabId == null) return false;
+  if (tabId == null) return null;
+  try { return (await chrome.tabs.get(tabId)).url || null; } catch { return null; }
+}
 
-  const fname = buildFilename(url, folder);
+async function downloadOne(url, folder) {
+  const pageUrl = await getPageUrl();
 
-  // Ensure content script is loaded (may not be injected on first open)
-  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] }).catch(() => {});
+  const dlOptions = {
+    url,
+    filename: buildFilename(url, folder),
+    saveAs: false,
+    conflictAction: "uniquify",
+  };
+  // The downloads API accepts Referer as a custom header (not subject to the
+  // Fetch spec's forbidden-header restriction).  Setting it to the page URL
+  // satisfies CDN hotlink-protection checks that require a matching Referer.
+  if (pageUrl) {
+    dlOptions.headers = [{ name: "Referer", value: pageUrl }];
+  }
 
   return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, { action: "downloadBlob", url, filename: fname }, (resp) => {
-      if (chrome.runtime.lastError || !resp?.ok) { resolve(false); return; }
-      resolve(true);
+    chrome.downloads.download(dlOptions, (id) => {
+      const err = chrome.runtime.lastError?.message || null;
+      if (err || id == null) { resolve(false); return; }
+
+      // Watch for download interruption (e.g. CDN returns 403 / HTML error page).
+      const onChanged = (delta) => {
+        if (delta.id !== id) return;
+        const state = delta.state?.current;
+        if (state === "complete" || state === "interrupted") {
+          chrome.downloads.onChanged.removeListener(onChanged);
+          resolve(state === "complete");
+        }
+      };
+      chrome.downloads.onChanged.addListener(onChanged);
+
+      // Safety timeout: if the download hasn't finished in 5 min, stop watching.
+      setTimeout(() => {
+        chrome.downloads.onChanged.removeListener(onChanged);
+        resolve(true);
+      }, 300_000);
     });
   });
 }

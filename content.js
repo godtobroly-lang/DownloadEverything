@@ -269,40 +269,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
-  // Download a URL by fetching it in the page context (which sends page cookies
-  // and the correct Referer automatically), turning it into a blob URL that is
-  // same-origin with the page, then clicking an <a download> anchor.
-  // Same-origin blob URLs bypass Chrome's cross-origin download restriction, so
-  // the file is saved instead of navigated to.
-  // Running in the content script means the download survives popup closure.
-  if (msg.action === "downloadBlob") {
-    (async () => {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 120_000);
-        const resp = await fetch(msg.url, {
-          credentials: "include",
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-        const blob    = await resp.blob();
-        const blobUrl = URL.createObjectURL(blob);
-
-        const a = document.createElement("a");
-        a.href     = blobUrl;
-        a.download = msg.filename || "";
-        a.style.display = "none";
-        (document.body || document.documentElement).appendChild(a);
-        a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-
-        setTimeout(() => { try { a.remove(); URL.revokeObjectURL(blobUrl); } catch {} }, 60_000);
-        sendResponse({ ok: true });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e) });
-      }
-    })();
-    return true;
-  }
 });
