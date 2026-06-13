@@ -93,12 +93,19 @@ async function getPageUrl() {
 }
 
 // declarativeNetRequest is the only API that can set the Referer header at the
-// network layer. We add a temporary rule before asking the content script to
-// fetch, so its request carries the correct Referer for CDN hotlink checks.
-// The rule is removed on the next popup open (see init).
+// network layer. The popup adds a temporary rule before the content script
+// fetches, so its request carries the correct Referer for CDN hotlink checks.
+//
+// MV3 content-script fetches are subject to CORS (unlike extension pages, they
+// are NOT exempted by host_permissions), so the same rule also injects CORS
+// response headers — otherwise the cross-origin fetch is blocked and nothing
+// downloads. The rule is removed on the next popup open (see init).
 const REFERER_RULE_ID = 1037;
 
 async function addRefererRule(host, referer) {
+  let origin = "*";
+  try { origin = new URL(referer).origin; } catch {}
+
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: [REFERER_RULE_ID],
     addRules: [{
@@ -106,7 +113,13 @@ async function addRefererRule(host, referer) {
       priority: 1,
       action: {
         type: "modifyHeaders",
-        requestHeaders: [{ header: "referer", operation: "set", value: referer }],
+        requestHeaders: [
+          { header: "referer", operation: "set", value: referer },
+        ],
+        responseHeaders: [
+          { header: "access-control-allow-origin",      operation: "set", value: origin },
+          { header: "access-control-allow-credentials", operation: "set", value: "true" },
+        ],
       },
       condition: {
         requestDomains: [host],
