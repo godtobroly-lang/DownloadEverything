@@ -7,8 +7,7 @@
     "downloads",
     "activeTab",
     "scripting",
-    "storage",
-    "declarativeNetRequest"
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"

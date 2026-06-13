@@ -86,58 +86,87 @@ async function getActiveTabId() {
   return _activeTabId;
 }
 
-async function getPageUrl() {
-  const tabId = await getActiveTabId();
-  if (tabId == null) return null;
-  try { return (await chrome.tabs.get(tabId)).url || null; } catch { return null; }
+// Content-script fallback: triggers download inside the page context so the
+// request carries the page's Referer and session cookies.
+async function downloadViaContentScript(url, folder) {
+  try {
+    const tabId = await getActiveTabId();
+    if (tabId == null) return false;
+    const resp = await chrome.tabs.sendMessage(tabId, {
+      action: "downloadViaLink",
+      url,
+      filename: buildFilename(url, folder),
+    });
+    return resp?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+// Wait for a download to reach a terminal state (complete / interrupted).
+// Resolves with true on success, false on failure.
+// Times out after `ms` milliseconds and assumes success (avoids blocking forever).
+function waitForDownload(id, ms = 60_000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      chrome.downloads.onChanged.removeListener(listener);
+      resolve(true); // timed out — assume in progress / success
+    }, ms);
+
+    function listener(delta) {
+      if (delta.id !== id) return;
+      const state = delta.state?.current;
+      if (state === "complete") {
+        clearTimeout(timer);
+        chrome.downloads.onChanged.removeListener(listener);
+        resolve(true);
+      } else if (state === "interrupted") {
+        clearTimeout(timer);
+        chrome.downloads.onChanged.removeListener(listener);
+        resolve(false);
+      }
+    }
+
+    chrome.downloads.onChanged.addListener(listener);
+  });
 }
 
 async function downloadOne(url, folder) {
-  const pageUrl = await getPageUrl();
-
-  const dlOptions = {
-    url,
-    filename: buildFilename(url, folder),
-    saveAs: false,
-    conflictAction: "uniquify",
-  };
-  // The downloads API accepts Referer as a custom header (not subject to the
-  // Fetch spec's forbidden-header restriction).  Setting it to the page URL
-  // satisfies CDN hotlink-protection checks that require a matching Referer.
-  if (pageUrl) {
-    dlOptions.headers = [{ name: "Referer", value: pageUrl }];
-  }
-
-  return new Promise((resolve) => {
-    chrome.downloads.download(dlOptions, (id) => {
-      const err = chrome.runtime.lastError?.message || null;
-      if (err || id == null) { resolve(false); return; }
-
-      // Watch for download interruption (e.g. CDN returns 403 / HTML error page).
-      const onChanged = (delta) => {
-        if (delta.id !== id) return;
-        const state = delta.state?.current;
-        if (state === "complete" || state === "interrupted") {
-          chrome.downloads.onChanged.removeListener(onChanged);
-          resolve(state === "complete");
-        }
-      };
-      chrome.downloads.onChanged.addListener(onChanged);
-
-      // Safety timeout: if the download hasn't finished in 5 min, stop watching.
-      setTimeout(() => {
-        chrome.downloads.onChanged.removeListener(onChanged);
-        resolve(true);
-      }, 300_000);
+  // 1. Attempt chrome.downloads (supports folder targeting, shows in download bar).
+  const { id, startErr } = await new Promise((resolve) => {
+    chrome.downloads.download({
+      url,
+      filename: buildFilename(url, folder),
+      saveAs: false,
+      conflictAction: "uniquify",
+    }, (id) => {
+      resolve({ id, startErr: chrome.runtime.lastError?.message || null });
     });
   });
+
+  if (startErr || id == null) {
+    // Couldn't even start — go straight to fallback.
+    return downloadViaContentScript(url, folder);
+  }
+
+  // 2. Monitor the download. chrome.downloads returns a valid id even when the
+  //    server subsequently returns 404 — we must watch onChanged to detect that.
+  const success = await waitForDownload(id);
+  if (success) return true;
+
+  console.warn("chrome.downloads interrupted for:", url, "— using content-script fallback");
+
+  // 3. Fallback: page-context anchor click (correct Referer + cookies).
+  //    Note: folder targeting is best-effort for cross-origin resources because
+  //    browsers ignore the `download` attribute path for cross-origin URLs.
+  return downloadViaContentScript(url, folder);
 }
 
 async function downloadBatch(items, folder) {
   let ok = 0;
   for (const item of items) {
     if (await downloadOne(item.url, folder)) ok++;
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 200));
   }
   return ok;
 }

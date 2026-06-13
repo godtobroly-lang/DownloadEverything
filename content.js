@@ -269,4 +269,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  // Fallback download: anchor click in the page context so the request carries
+  // the correct Referer and session cookies, bypassing CDN hotlink protection.
+  if (msg.action === "downloadViaLink") {
+    try {
+      const a = document.createElement("a");
+      a.href     = msg.url;
+      a.download = msg.filename || "";
+      a.rel      = "noopener";
+      a.style.display = "none";
+      (document.body || document.documentElement).appendChild(a);
+
+      // MouseEvent dispatch is more reliable than .click() in some page contexts
+      a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+
+      setTimeout(() => { try { a.remove(); } catch {} }, 2000);
+      sendResponse({ ok: true });
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e) });
+    }
+    return true;
+  }
 });
