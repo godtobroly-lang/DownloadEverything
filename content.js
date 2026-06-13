@@ -269,21 +269,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
-  // Fallback download: create an <a download> in the page context so the
-  // request carries the page's Referer and session cookies — bypasses the
-  // hotlink-protection limitation of chrome.downloads.download.
+  // Fallback download: anchor click in the page context so the request carries
+  // the correct Referer and session cookies, bypassing CDN hotlink protection.
   if (msg.action === "downloadViaLink") {
     try {
       const a = document.createElement("a");
-      a.href  = msg.url;
-      // download attribute is honored for same-origin; for cross-origin it
-      // still triggers the browser's download flow with the correct Referer.
+      a.href     = msg.url;
       a.download = msg.filename || "";
-      a.rel = "noopener";
+      a.rel      = "noopener";
       a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => { try { document.body.removeChild(a); } catch {} }, 1500);
+      (document.body || document.documentElement).appendChild(a);
+
+      // MouseEvent dispatch is more reliable than .click() in some page contexts
+      a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+
+      setTimeout(() => { try { a.remove(); } catch {} }, 2000);
       sendResponse({ ok: true });
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
